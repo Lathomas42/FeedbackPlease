@@ -1,0 +1,332 @@
+#include "io/IOBackend.h"
+
+#ifdef FP_HAVE_DAQMX
+
+#include <NIDAQmx.h>
+
+#include <algorithm>
+#include <vector>
+
+#include "core/WavFile.h"
+
+namespace fp {
+
+namespace {
+
+int32 toDaqTerminal(TerminalConfig t) {
+    switch (t) {
+        case TerminalConfig::RSE: return DAQmx_Val_RSE;
+        case TerminalConfig::NRSE: return DAQmx_Val_NRSE;
+        case TerminalConfig::Differential: return DAQmx_Val_Diff;
+        case TerminalConfig::PseudoDiff: return DAQmx_Val_PseudoDiff;
+        case TerminalConfig::Default: break;
+    }
+    return DAQmx_Val_Cfg_Default;
+}
+
+std::string daqError(int32 code, const char* what) {
+    char buf[2048] = {};
+    DAQmxGetExtendedErrorInfo(buf, sizeof buf);
+    return std::string(what) + " failed (" + std::to_string(code) + "): " + buf;
+}
+
+// Input:   continuous hardware-timed AI, read in frames from the engine thread.
+// Digital: software-timed (on-demand) DO lines, written only when they change.
+// Analog:  a finite, committed AO task holding one feedback waveform. The wave is
+//          written while the state machine is in its delay ("arm"), so delivery only
+//          costs a DAQmxStartTask on an already committed task.
+class DaqBackend final : public IOBackend {
+public:
+    ~DaqBackend() override { stop(); }
+
+    bool start(const AppParams& p, std::string& err) override {
+        stop();
+        fs_ = p.hw.sampleRate;
+        const bool ok = startAI(p, err) && startDO(p, err) && startAO(p, err) &&
+                        check(DAQmxStartTask(ai_), "DAQmxStartTask(AI)", err);
+        if (!ok) stop();
+        return ok;
+    }
+
+    void stop() override {
+        if (do_) {
+            writeDigital(DigitalOutputs{});
+            DAQmxStopTask(do_);
+            DAQmxClearTask(do_);
+            do_ = 0;
+        }
+        for (TaskHandle* t : {&ai_, &ao_}) {
+            if (*t) {
+                DAQmxStopTask(*t);
+                DAQmxClearTask(*t);
+                *t = 0;
+            }
+        }
+        doCount_ = 0;
+        lastDo_ = DigitalOutputs{};
+        aoLoaded_ = aoPending_ = 0;
+        aoStarted_ = false;
+        waves_[0].clear();
+        waves_[1].clear();
+    }
+
+    double sampleRate() const override { return fs_; }
+
+    bool read(float* dst, int n, std::string& err) override {
+        if (int(buf_.size()) < n) buf_.resize(n);
+        int32 got = 0;
+        const int32 code = DAQmxReadAnalogF64(ai_, n, 2.0, DAQmx_Val_GroupByChannel, buf_.data(), uInt32(n), &got, nullptr);
+        if (DAQmxFailed(code)) {
+            err = daqError(code, "DAQmxReadAnalogF64");
+            return false;
+        }
+        if (got != n) {
+            err = "DAQmxReadAnalogF64 returned " + std::to_string(got) + " of " + std::to_string(n) + " samples";
+            return false;
+        }
+        for (int i = 0; i < n; ++i) dst[i] = float(buf_[i]);
+        return true;
+    }
+
+    size_t backlog() override {
+        uInt32 avail = 0;
+        if (ai_) DAQmxGetReadAvailSampPerChan(ai_, &avail);
+        return avail;
+    }
+
+    void writeDigital(const DigitalOutputs& d) override {
+        if (!do_ || d == lastDo_) return;
+        uInt8 data[4];
+        int k = 0;
+        if (hasFb_) data[k++] = d.feedback;
+        if (hasSyl_) data[k++] = d.syllable;
+        if (hasMatch_) data[k++] = d.match;
+        if (hasSong_) data[k++] = d.song;
+        int32 written = 0;
+        const int32 code = DAQmxWriteDigitalLines(do_, 1, 1, 0.1, DAQmx_Val_GroupByChannel, data, &written, nullptr);
+        if (DAQmxFailed(code)) outErr_ = daqError(code, "DAQmxWriteDigitalLines");
+        lastDo_ = d;
+    }
+
+    void armWave(int w) override {
+        if (!hasWave(w)) return;
+        if (aoBusy()) {
+            aoPending_ = w;  // load once the current playback finishes
+            return;
+        }
+        if (aoLoaded_ != w) loadWave(w);
+    }
+
+    void fireWave(int w) override {
+        if (!hasWave(w)) return;
+        if (aoBusy()) {
+            DAQmxStopTask(ao_);  // truncate the previous stimulus
+            aoStarted_ = false;
+        }
+        if (aoLoaded_ != w && !loadWave(w)) return;
+        const int32 code = DAQmxStartTask(ao_);
+        if (DAQmxFailed(code)) {
+            outErr_ = daqError(code, "DAQmxStartTask(AO)");
+            return;
+        }
+        aoStarted_ = true;
+        aoPending_ = 0;
+    }
+
+    void service() override {
+        if (aoPending_ && !aoBusy()) {
+            if (aoLoaded_ != aoPending_) loadWave(aoPending_);
+            aoPending_ = 0;
+        }
+    }
+
+    std::string takeOutputError() override {
+        std::string e;
+        e.swap(outErr_);
+        return e;
+    }
+
+    const char* name() const override { return "NI-DAQmx"; }
+
+private:
+    bool check(int32 code, const char* what, std::string& err) {
+        if (DAQmxFailed(code)) {
+            err = daqError(code, what);
+            return false;
+        }
+        return true;
+    }
+
+    bool startAI(const AppParams& p, std::string& err) {
+        const auto& hw = p.hw;
+        const uInt32 bufSamps = uInt32(std::max(hw.sampleRate * hw.inputBufferSec, 10.0 * hw.samplesPerFrame));
+        return check(DAQmxCreateTask("FeedbackPlease_AI", &ai_), "DAQmxCreateTask(AI)", err) &&
+               check(DAQmxCreateAIVoltageChan(ai_, hw.aiChannel.c_str(), "", toDaqTerminal(hw.terminalConfig),
+                                              hw.aiMin, hw.aiMax, DAQmx_Val_Volts, nullptr),
+                     "DAQmxCreateAIVoltageChan", err) &&
+               check(DAQmxCfgSampClkTiming(ai_, "", hw.sampleRate, DAQmx_Val_Rising, DAQmx_Val_ContSamps, bufSamps),
+                     "DAQmxCfgSampClkTiming(AI)", err) &&
+               check(DAQmxCfgInputBuffer(ai_, bufSamps), "DAQmxCfgInputBuffer", err) &&
+               check(DAQmxGetSampClkRate(ai_, &fs_), "DAQmxGetSampClkRate", err);  // actual (coerced) rate
+    }
+
+    bool startDO(const AppParams& p, std::string& err) {
+        const auto& hw = p.hw;
+        hasFb_ = !hw.doFeedbackLine.empty();
+        hasSyl_ = !hw.doSyllableLine.empty();
+        hasMatch_ = !hw.doMatchLine.empty();
+        hasSong_ = !hw.doSongLine.empty();
+        if (!hasFb_ && !hasSyl_ && !hasMatch_ && !hasSong_) return true;
+        if (!check(DAQmxCreateTask("FeedbackPlease_DO", &do_), "DAQmxCreateTask(DO)", err)) return false;
+        // Channel order must match the data order in writeDigital().
+        for (const std::string* line : {&hw.doFeedbackLine, &hw.doSyllableLine, &hw.doMatchLine, &hw.doSongLine}) {
+            if (line->empty()) continue;
+            if (!check(DAQmxCreateDOChan(do_, line->c_str(), "", DAQmx_Val_ChanForAllLines), "DAQmxCreateDOChan", err))
+                return false;
+            ++doCount_;
+        }
+        if (!check(DAQmxStartTask(do_), "DAQmxStartTask(DO)", err)) return false;
+        lastDo_.feedback = !lastDo_.feedback;  // force the initial all-low write
+        writeDigital(DigitalOutputs{});
+        return outErr_.empty() || (err = outErr_, false);
+    }
+
+    bool startAO(const AppParams& p, std::string& err) {
+        const auto& hw = p.hw;
+        const std::string* paths[2] = {&p.fb.wave1, &p.fb.wave2};
+        if (hw.aoChannel.empty() || (paths[0]->empty() && paths[1]->empty())) return true;
+
+        double rate = 0.0;
+        size_t len = 0;
+        for (int i = 0; i < 2; ++i) {
+            if (paths[i]->empty()) continue;
+            WavData w;
+            if (!readWav(*paths[i], w, &err)) return false;
+            if (rate != 0.0 && w.sampleRate != rate) {
+                err = "feedback wave files must have the same sample rate";
+                return false;
+            }
+            rate = w.sampleRate;
+            waves_[i].resize(w.samples.size());
+            for (size_t k = 0; k < w.samples.size(); ++k)
+                waves_[i][k] = std::clamp(double(w.samples[k]) * hw.aoScale, hw.aoMin, hw.aoMax);
+            len = std::max(len, waves_[i].size());
+        }
+        // Both waves share one finite task, so pad to a common length. Trailing zeros
+        // leave the output at 0 V when playback ends.
+        len += 16;
+        for (auto& w : waves_)
+            if (!w.empty()) w.resize(len, 0.0);
+        aoLen_ = len;
+
+        return check(DAQmxCreateTask("FeedbackPlease_AO", &ao_), "DAQmxCreateTask(AO)", err) &&
+               check(DAQmxCreateAOVoltageChan(ao_, hw.aoChannel.c_str(), "", hw.aoMin, hw.aoMax, DAQmx_Val_Volts,
+                                              nullptr),
+                     "DAQmxCreateAOVoltageChan", err) &&
+               check(DAQmxCfgSampClkTiming(ao_, "", rate, DAQmx_Val_Rising, DAQmx_Val_FiniteSamps, uInt64(len)),
+                     "DAQmxCfgSampClkTiming(AO)", err) &&
+               // Every write replaces the whole buffer from sample 0.
+               check(DAQmxSetWriteRelativeTo(ao_, DAQmx_Val_FirstSample), "DAQmxSetWriteRelativeTo", err) &&
+               check(DAQmxSetWriteOffset(ao_, 0), "DAQmxSetWriteOffset", err) &&
+               (loadWave(hasWave(1) ? 1 : 2) || (err = outErr_, false)) &&
+               check(DAQmxTaskControl(ao_, DAQmx_Val_Task_Commit), "DAQmxTaskControl(commit AO)", err);
+    }
+
+    bool hasWave(int w) const { return ao_ && (w == 1 || w == 2) && !waves_[w - 1].empty(); }
+
+    bool aoBusy() {
+        if (!aoStarted_) return false;
+        bool32 done = 0;
+        DAQmxIsTaskDone(ao_, &done);
+        if (!done) return true;
+        DAQmxStopTask(ao_);  // back to the committed state, ready to restart quickly
+        aoStarted_ = false;
+        return false;
+    }
+
+    bool loadWave(int w) {
+        int32 written = 0;
+        const int32 code = DAQmxWriteAnalogF64(ao_, int32(aoLen_), 0, 1.0, DAQmx_Val_GroupByChannel,
+                                               waves_[w - 1].data(), &written, nullptr);
+        if (DAQmxFailed(code)) {
+            outErr_ = daqError(code, "DAQmxWriteAnalogF64");
+            aoLoaded_ = 0;
+            return false;
+        }
+        aoLoaded_ = w;
+        return true;
+    }
+
+    TaskHandle ai_ = 0, do_ = 0, ao_ = 0;
+    double fs_ = 40000.0;
+    std::vector<float64> buf_;
+
+    bool hasFb_ = false, hasSyl_ = false, hasMatch_ = false, hasSong_ = false;
+    int doCount_ = 0;
+    DigitalOutputs lastDo_;
+
+    std::vector<float64> waves_[2];
+    size_t aoLen_ = 0;
+    int aoLoaded_ = 0, aoPending_ = 0;
+    bool aoStarted_ = false;
+
+    std::string outErr_;
+};
+
+}  // namespace
+
+std::unique_ptr<IOBackend> makeDaqBackend() { return std::make_unique<DaqBackend>(); }
+bool daqAvailable() { return true; }
+
+std::string describeDaqDevices() {
+    char devs[2048] = {};
+    if (DAQmxFailed(DAQmxGetSysDevNames(devs, sizeof devs))) return "(device query failed)";
+    std::string out;
+    const std::string all = devs;
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t end = all.find(',', pos);
+        if (end == std::string::npos) end = all.size();
+        std::string name = all.substr(pos, end - pos);
+        name.erase(0, name.find_first_not_of(' '));
+        if (!name.empty()) {
+            char type[256] = {};
+            DAQmxGetDevProductType(name.c_str(), type, sizeof type);
+            if (!out.empty()) out += ", ";
+            out += name + " (" + type + ")";
+        }
+        pos = end + 1;
+    }
+    return out.empty() ? "(none)" : out;
+}
+
+}  // namespace fp
+
+#else  // built without NI-DAQmx
+
+namespace fp {
+
+namespace {
+class NoDaqBackend final : public IOBackend {
+public:
+    bool start(const AppParams&, std::string& err) override {
+        err = "This build has no NI-DAQmx support. Install NI-DAQmx and rebuild, or use the simulated source.";
+        return false;
+    }
+    void stop() override {}
+    double sampleRate() const override { return 0.0; }
+    bool read(float*, int, std::string& err) override {
+        err = "no DAQmx";
+        return false;
+    }
+    const char* name() const override { return "NI-DAQmx (unavailable)"; }
+};
+}  // namespace
+
+std::unique_ptr<IOBackend> makeDaqBackend() { return std::make_unique<NoDaqBackend>(); }
+bool daqAvailable() { return false; }
+std::string describeDaqDevices() { return "(built without NI-DAQmx)"; }
+
+}  // namespace fp
+
+#endif

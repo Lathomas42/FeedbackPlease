@@ -1,0 +1,6 @@
+build/
+recordings/
+feedbackplease.ini
+feedbackplease_crash.txt
+*.user
+.vs/
