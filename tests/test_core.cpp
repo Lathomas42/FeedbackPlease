@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/BandEnvelope.h"
@@ -11,8 +14,11 @@
 #include "core/FeedbackStateMachine.h"
 #include "core/Filters.h"
 #include "core/Offline.h"
+#include "core/WavFile.h"
 #include "core/Params.h"
 #include "core/SongDetector.h"
+#include "core/SongRecorder.h"
+#include "core/SyllableCodes.h"
 #include "core/SynthSong.h"
 #include "core/Syllables.h"
 
@@ -57,8 +63,8 @@ static void testBandEnvelopeSine() {
 
 static void testSegmenterAndMatcher() {
     SyllableSegmenter seg;
-    SequenceMatcher m;
-    SequenceParams sp;  // IOI,SD,IOI with 124 / 95 / 95 +-10
+    SyllableClassifier m;
+    SyllableCodeParams sp;  // default: the "target" syllable, IOI,SD,IOI with 124 / 95 / 95 +-10
     // Onsets at 0, 95, 219 ms. Syllable starting at 95 lasts 95 ms.
     struct Ev { double t; double v; };
     std::vector<Ev> evs = {{0, 1}, {40, 0}, {95, 1}, {190, 0}, {219, 1}};
@@ -67,13 +73,13 @@ static void testSegmenterAndMatcher() {
         auto o = seg.update(e.v, e.t, 0.5, 0.2);
         auto r = m.update(o, sp);
         evaluations += r.evaluated;
-        matches += r.match;
+        matches += r.index == sp.target;
     }
     CHECK(evaluations == 2);  // at the 2nd and 3rd onsets
     CHECK(matches == 1);
-    CHECK(std::fabs(m.curIoi() - 124) < 1e-9);
+    CHECK(std::fabs(m.ioi() - 124) < 1e-9);
     CHECK(std::fabs(m.prevIoi() - 95) < 1e-9);
-    CHECK(std::fabs(m.lastSd() - 95) < 1e-9);
+    CHECK(std::fabs(m.sd() - 95) < 1e-9);
 
     // Hysteresis: dipping between the thresholds does not end a syllable.
     SyllableSegmenter s2;
@@ -105,6 +111,17 @@ static void testStateMachine() {
     p.thresh1 = 0.5;
     auto o = fsm2.update(true, 0.1, 1.0, p);
     CHECK(o.fire == 0 && o.suppressed == 1);
+
+    // Turning feedback off during the delay cancels the pending delivery.
+    {
+        FeedbackParams q;  // delay 20 ms
+        FeedbackStateMachine f(7);
+        f.update(true, 1.0, 1.0, q);  // trial starts, now in Delay 1
+        q.enabled = false;
+        int fired = 0;
+        for (int i = 0; i < 50; ++i) fired += f.update(false, 1.0, 1.0, q).fire != 0;
+        CHECK(fired == 0 && f.state() == FbState::Listening);
+    }
 
     // Probability 0 gives a catch trial.
     FeedbackStateMachine fsm3(7);
@@ -262,28 +279,239 @@ static void testOfflineMatchesRealtime() {
     std::printf("  %zu frames, %zu syllables, %zu matches, %zu feedback: identical\n", env.value.size(),
                 dt.syllables.size(), dt.matchMs.size(), offFires.size());
 
-    // A syllable that matched should carry the setpoint values that made it match.
+    // A syllable that matched should carry the values that made it the target.
+    const SyllableCode& t = *targetSyllable(p.codes);
     for (const auto& s : dt.syllables)
         if (s.matched) {
-            CHECK(std::fabs(s.ioiMs - p.seq.ioiSetpointMs) <= p.seq.ioiEpsMs);
-            CHECK(std::fabs(s.prevSdMs - p.seq.sdSetpointMs) <= p.seq.sdEpsMs);
-            CHECK(std::fabs(s.prevIoiMs - p.seq.prevIoiSetpointMs) <= p.seq.prevIoiEpsMs);
+            CHECK(s.codeIndex == p.codes.target);
+            CHECK(t.ioi.contains(s.ioiMs, t.mode) && t.sd.contains(s.prevSdMs, t.mode) &&
+                  t.prevIoi.contains(s.prevIoiMs, t.mode));
         }
+}
+
+static void testTargetIsFirstMatch() {
+    // The target only fires when it is the first syllable in the list that matches.
+    AppParams p;
+    const auto song = synthesizeSong(p.hw.sampleRate, 10.0, p.source.simNoiseVolts);
+    const AppParams pr0 = paramsForRate(p, p.hw.sampleRate);
+    EnvelopeTrack env;
+    SongTrack st;
+    computeEnvelopeTrack(song, pr0, env);
+    computeSongTrack(song, pr0, st);
+    DecisionTrack a, b, c;
+    runDecisions(env, st, pr0, a);  // default: target is the only syllable
+    CHECK(a.matchMs.size() >= 7);
+
+    AppParams p2 = p;  // a broad "any IOI 50-200 ms" syllable listed before the target swallows it
+    SyllableCode any = defaultTargetSyllable();
+    any.name = "any";
+    any.code = 9;
+    any.type = TriggerType::IOI;
+    any.mode = RangeMode::MinMax;
+    any.ioi.minMs = 50;
+    any.ioi.maxMs = 200;
+    p2.codes.list.insert(p2.codes.list.begin(), any);
+    p2.codes.target = 1;
+    runDecisions(env, st, paramsForRate(p2, p.hw.sampleRate), b);
+    CHECK(b.matchMs.empty() && b.fire1Ms.empty());
+
+    p2.codes.target = 0;  // now "any" itself is the target: every classified syllable
+    runDecisions(env, st, paramsForRate(p2, p.hw.sampleRate), c);
+    size_t classified = 0;
+    for (const auto& s : c.syllables) classified += s.codeIndex == 0;
+    // Early-bout matches can be blocked by the song gate, so count both.
+    CHECK(c.matchMs.size() + c.blockedMs.size() == classified && classified > a.matchMs.size());
+
+    p2.codes.target = -1;  // no target: no feedback at all
+    runDecisions(env, st, paramsForRate(p2, p.hw.sampleRate), c);
+    CHECK(c.matchMs.empty() && c.fire1Ms.empty());
+}
+
+static void testLegacySettingsMigrate() {
+    // A settings file from before syllables existed: its single target becomes a syllable.
+    {
+        std::FILE* f = std::fopen("fp_legacy.ini", "w");
+        std::fputs("seq.trigger_type = 3\nseq.ioi_setpoint_ms = 130\nseq.ioi_eps_ms = 7\nseq.sd_setpoint_ms = 88\n", f);
+        std::fclose(f);
+    }
+    AppParams p;
+    CHECK(loadParams("fp_legacy.ini", p));
+    CHECK(p.codes.list.size() == 1 && p.codes.target == 0);
+    if (!p.codes.list.empty()) {
+        const auto& c = p.codes.list[0];
+        CHECK(c.type == TriggerType::SD_IOI && c.ioi.setpointMs == 130 && c.ioi.epsMs == 7 && c.sd.setpointMs == 88 &&
+              c.ioi.minMs == 123 && c.ioi.maxMs == 137);
+    }
+    std::remove("fp_legacy.ini");
+}
+
+static SyllableCode makeCode(const char* name, int code, TriggerType type, double ioi, double sd, double prevIoi,
+                             double eps = 10) {
+    SyllableCode c;
+    c.name = name;
+    c.code = code;
+    c.type = type;
+    c.ioi = {ioi, eps, ioi - eps, ioi + eps};
+    c.sd = {sd, eps, sd - eps, sd + eps};
+    c.prevIoi = {prevIoi, eps, prevIoi - eps, prevIoi + eps};
+    return c;
+}
+
+static void testSyllableClassifier() {
+    // Onsets at 0, 100, 250 ms; durations 60, 80.
+    // At 100: IOI 100, SD (prev) 60, no prev IOI. At 250: IOI 150, SD 80, prev IOI 100.
+    SyllableCodeParams p;
+    p.list.clear();  // drop the default target
+    p.list.push_back(makeCode("x", 9, TriggerType::IOI_SD_IOI, 150, 80, 100));
+    SyllableCode y = makeCode("y", 7, TriggerType::SD_IOI, 0, 0, 0);
+    y.mode = RangeMode::MinMax;
+    y.ioi.minMs = 140;
+    y.ioi.maxMs = 160;
+    y.sd.minMs = 70;
+    y.sd.maxMs = 90;
+    p.list.push_back(y);
+    p.list.push_back(makeCode("z", 3, TriggerType::IOI, 100, 0, 0, 5));
+    auto run = [](const SyllableCodeParams& pp) {
+        SyllableSegmenter seg;
+        SyllableClassifier cl;
+        std::vector<int> codes;
+        for (auto [t, v] : std::vector<std::pair<double, double>>{{0, 1}, {60, 0}, {100, 1}, {180, 0}, {250, 1}}) {
+            auto r = cl.update(seg.update(v, t, 0.5, 0.2), pp);
+            if (r.evaluated) codes.push_back(r.code);
+        }
+        return codes;
+    };
+    auto c = run(p);
+    CHECK(c.size() == 2 && c[0] == 3 && c[1] == 9);  // "x" needs a previous IOI, so the first IOI end is "z"
+    std::swap(p.list[0], p.list[1]);
+    c = run(p);
+    CHECK(c.size() == 2 && c[1] == 7);  // x and y both fit the second IOI end; the first listed wins
+
+    // Min/max and setpoint/eps describe the same window after converting.
+    TimeWindow w{120, 8, 0, 0};
+    w.convertTo(RangeMode::MinMax);
+    CHECK(w.minMs == 112 && w.maxMs == 128 && w.contains(112, RangeMode::MinMax) && !w.contains(111.9, RangeMode::MinMax));
+    w.minMs = 100;
+    w.convertTo(RangeMode::SetpointEps);
+    CHECK(w.setpointMs == 114 && w.epsMs == 14);
+}
+
+static void testSyllableCodesOnSong() {
+    // Label every syllable of the synthetic motif after the first. Motif timing as
+    // measured: IOIs A-B 90, B-C 95, C-D 124, D-E 150 ms; SDs A 59, B 69, C 91, D 109.
+    AppParams p;
+    SyllableCode e = makeCode("E", 5, TriggerType::SD_IOI, 0, 0, 0);
+    e.mode = RangeMode::MinMax;  // E by min/max: IOI 140-160, SD of D 100-120
+    e.ioi.minMs = 140;
+    e.ioi.maxMs = 160;
+    e.sd.minMs = 100;
+    e.sd.maxMs = 120;
+    p.codes.list = {
+        makeCode("B", 2, TriggerType::IOI, 90, 0, 0, 3),
+        makeCode("C", 3, TriggerType::SD_IOI, 95, 69, 0, 4),
+        makeCode("D", 4, TriggerType::IOI_SD_IOI, 124, 91, 95, 5),
+        e,
+    };
+    const auto song = synthesizeSong(p.hw.sampleRate, 10.0, p.source.simNoiseVolts);
+    const AppParams pr = paramsForRate(p, p.hw.sampleRate);
+    EnvelopeTrack env;
+    SongTrack st;
+    DecisionTrack dt;
+    computeEnvelopeTrack(song, pr, env);
+    computeSongTrack(song, pr, st);
+    runDecisions(env, st, pr, dt);
+    int counts[6] = {0};
+    int unlabeled = 0;
+    std::string seq;
+    for (const auto& s : dt.syllables) {
+        if (s.code) ++counts[s.code];
+        else ++unlabeled;
+        seq += s.code ? char('A' + s.code - 1) : '.';
+    }
+    std::printf("  labels: %s\n", seq.c_str());
+    // Each motif: A unlabeled (it follows the long inter-motif gap), then B C D E.
+    // The file may end part-way through a motif.
+    std::string expected;
+    while (expected.size() < seq.size()) expected += ".BCDE";
+    expected.resize(seq.size());
+    CHECK(seq == expected);
+    CHECK(counts[2] >= 7 && unlabeled >= 7);
+}
+
+static void testSongFiles() {
+    // 1 kHz, 10-sample frames, 0.5 s pre-roll, 0.3 s post-roll. The "mic" signal is the
+    // sample index, so each file's first sample and length show exactly what was saved.
+    SongFileConfig cfg;
+    cfg.prefix = "fp_songtest";
+    cfg.sampleRate = 1000.0;
+    cfg.preRollSec = 0.5;
+    cfg.postRollSec = 0.3;
+    SongFileWriter w;
+    CHECK(w.open(cfg));
+    CHECK(w.channels() == 3);
+    auto songOn = [](int f) {
+        return (f >= 100 && f < 150) ||  // song 1 ...
+               (f >= 165 && f < 170) ||  // ... resumes within the post-roll: same file
+               (f >= 300 && f < 310) ||  // song 2
+               (f >= 345 && f < 350) ||  // song 3 starts 50 ms after file 2 closed: pre-roll overlaps it
+               f >= 400;                 // song 4 still on when recording stops
+    };
+    float mic[10];
+    for (int f = 0; f < 420; ++f) {
+        for (int i = 0; i < 10; ++i) mic[i] = float(f * 10 + i);
+        w.push(mic, 10, 0.5f, songOn(f) ? 0.1f : 0.0f, songOn(f));
+    }
+    CHECK(w.recording());
+    w.close();
+    CHECK(w.filesDone() == 4);
+
+    // {first sample, length}: pre-roll (up to 500) + song + 300 post-roll.
+    const std::pair<int, int> expected[4] = {{500, 1500}, {2500, 900}, {2950, 850}, {3500, 700}};
+    for (int k = 0; k < 4; ++k) {
+        char name[64];
+        std::snprintf(name, sizeof name, "fp_songtest_song%03d.wav", k + 1);
+        WavData d;
+        CHECK(readWav(name, d));
+        const auto [first, len] = expected[k];
+        bool contiguous = d.samples.size() == size_t(len);
+        for (size_t i = 0; contiguous && i < d.samples.size(); ++i) contiguous = d.samples[i] == float(first + int(i));
+        std::printf("  song%03d: starts at sample %.0f, %zu samples (expect %d, %d)\n", k + 1,
+                    d.samples.empty() ? -1.0 : d.samples[0], d.samples.size(), first, len);
+        CHECK(contiguous);
+        std::remove(name);
+    }
+    std::ifstream idx("fp_songtest_songs.csv");
+    int rows = 0;
+    for (std::string line; std::getline(idx, line);) ++rows;
+    idx.close();
+    CHECK(rows == 5);  // header + 4 files
+    std::remove("fp_songtest_songs.csv");
 }
 
 static void testParamsRoundTrip() {
     AppParams a;
     a.hw.aiChannel = "PXI1Slot2/ai3";
     a.spectrum.include[2] = {2.5, 300, 900};
-    a.seq.type = TriggerType::SD_IOI;
     a.fb.wave1 = "C:\\stim\\noise #1.wav";
+    a.codes.list = {makeCode("A #1", 1, TriggerType::IOI, 90, 0, 0)};
+    a.codes.target = 1;
+    SyllableCode c2 = makeCode("B", 17, TriggerType::IOI_SD_IOI, 124, 91, 95, 7);
+    c2.mode = RangeMode::MinMax;
+    c2.sd.minMs = 80.5;
+    a.codes.list.push_back(c2);
     CHECK(saveParams("fp_test_params.ini", a));
     AppParams b;
     CHECK(loadParams("fp_test_params.ini", b));
     CHECK(b.hw.aiChannel == a.hw.aiChannel);
     CHECK(b.spectrum.include[2].gain == 2.5 && b.spectrum.include[2].highHz == 900);
-    CHECK(b.seq.type == TriggerType::SD_IOI);
     CHECK(b.fb.wave1 == a.fb.wave1);
+    CHECK(b.codes.list.size() == 2 && b.codes.target == 1);
+    CHECK(!b.codes.list.empty() && b.codes.list[0].name == "A #1");  // '#' survives in names
+    if (b.codes.list.size() == 2) {
+        const auto& c = b.codes.list[1];
+        CHECK(c.name == "B" && c.code == 17 && c.type == TriggerType::IOI_SD_IOI && c.mode == RangeMode::MinMax &&
+              c.sd.minMs == 80.5 && c.prevIoi.setpointMs == 95 && c.ioi.epsMs == 7);
+    }
     std::remove("fp_test_params.ini");
 }
 
@@ -304,6 +532,16 @@ int main() {
     testSongGate();
     std::printf("Offline analysis == real time\n");
     testOfflineMatchesRealtime();
+    std::printf("Syllable classifier\n");
+    testSyllableClassifier();
+    std::printf("Target = first match\n");
+    testTargetIsFirstMatch();
+    std::printf("Legacy settings migrate\n");
+    testLegacySettingsMigrate();
+    std::printf("Syllable codes on synthetic song\n");
+    testSyllableCodesOnSong();
+    std::printf("Song-triggered files\n");
+    testSongFiles();
     std::printf("Params round trip\n");
     testParamsRoundTrip();
     if (g_failures) {

@@ -4,10 +4,11 @@ Real-time birdsong syllable detection and feedback in C++, ported from the LabVI
 `DetectSyllables` / `CalcDetectSignal` / feedback-state-machine VIs.
 
 It reads one microphone channel through NI-DAQmx (40 kHz, 40-sample frames = 1 ms updates),
-computes a band-limited amplitude envelope over the last 15 ms, segments syllables, checks for a
-target IOI/SD sequence, and drives feedback: a waveform on an AO channel plus TTL lines for
-feedback, syllable state and sequence matches. The GUI shows the raw microphone voltage and the
-detection signal live.
+computes a band-limited amplitude envelope over the last 15 ms, segments syllables, and classifies
+each one against your list of syllable definitions (IOI / SD windows). The matched syllable's code goes
+out on a digital port, and when it is the **target** syllable, feedback is delivered: a waveform on an AO
+channel plus TTL lines. The GUI shows the raw microphone voltage and the detection signal live, and a
+Tune tab lets you define and tune syllables on a folder of recordings.
 
 ## Build
 
@@ -35,15 +36,36 @@ Build without hardware support with `-DFP_WITH_DAQMX=OFF`, or without the GUI wi
 ## Running
 
 1. Start with **Source = Simulated** and press **Start**. With no WAV file chosen it plays a built-in
-   synthetic song whose 3rd->4th syllables match the default `IOI, SD, IOI` setpoints, so you should see
+   synthetic song whose 4th syllable matches the default "target" syllable (`IOI, SD, IOI`), so you should see
    matches and feedback lines every ~1.2 s. Point **Song WAV** at a real recording to tune thresholds.
 2. Open **Hardware / Source**, set the device names (the panel lists the devices it found), and switch
    **Source** to NI-DAQmx. The defaults say `Dev1`; this PC has `Dev2`, `Dev3` (PCIe-6321) and `PXI1Slot6` (PXIe-6341).
 3. Settings are saved to `feedbackplease.ini` on exit (or with **Save settings**). Each session also saves
    a copy of the settings next to its recordings in `recordings/`.
 
-Detection settings (bands, thresholds, setpoints, feedback probabilities/delays) apply live while
+Detection settings (bands, thresholds, syllables, target, feedback probabilities/delays) apply live while
 running. Hardware, wave files and recording options apply at the next Start.
+
+## Recording
+
+Each Start creates `recordings/session_<date>_<time>_*` files (folder set under **Recording**):
+
+- `_settings.ini`: the settings used.
+- `_events.csv`: every onset, offset, syllable classification, match, feedback, song on/off, with the
+  sample index since Start.
+- **Song-triggered WAVs** `_song001.wav`, `_song002.wav`, ...: when the song detector turns on, a new
+  file starts with the last **Pre-roll** seconds of audio (kept in a ring buffer, so the start of the song
+  is included) and continues until song has been off for **Post-roll** seconds. Song resuming within the
+  post-roll extends the same file. A song that starts soon after a file closed still gets its full
+  pre-roll (it may overlap the previous file).
+  - Channels, each optional, in this order: **raw mic** (V), **detection signal** (linear, held per
+    1 ms frame) and **marker track** = 0.1 song + 0.2 syllable + 0.3 target match + 0.4 feedback (the TTL
+    line states; every combination is a distinct level).
+  - `_songs.csv` lists each file with its start / end sample on the same clock as the events CSV, its
+    duration and the pre-roll it actually got (less than requested right after Start).
+- `_envelope.wav` (optional): the continuous detection signal at the frame rate.
+
+All writing happens on a background thread; the acquisition thread only queues data.
 
 ## Tuning on recordings (Kernel Extraction equivalent)
 
@@ -55,24 +77,33 @@ is shared with the Live tab, so whatever you tune is what runs live. Save it per
    by clicking the list.
 2. **File view**: spectrogram, detection signal (log scale, like LabVIEW) and song detector, with
    linked time axes (scroll to zoom, drag to pan, **Zoom full** to reset).
-   - Yellow numbers are syllable durations (ms). Cyan numbers are IOIs, shown purple where the target matched.
+   - Yellow numbers are syllable durations (ms). Cyan numbers are IOIs, shown purple where the target
+     matched. Green labels are the syllable each one was classified as (amber = the one being edited).
    - Drag the **green/red horizontal lines** on the detection plot to set the start/end thresholds.
    - Drag the **band edges** on the spectrogram (green include / red subtract; tick *Song bands* for the
      song detector's bird / non-bird bands).
    - Drag the **duration threshold** (blue) and **ratio threshold** (grey) on the song plot.
-   - Hover a syllable for its SD / IOI / previous values. **Ctrl+click a syllable to make it the
-     target**: the setpoints are filled from that syllable for the current trigger type.
+   - Hover a syllable for its SD / IOI / previous values. **Ctrl+click** a syllable to centre the
+     syllable being edited on it (window widths are kept). **Ctrl+Shift+click** adds it as a new
+     syllable and selects it for editing.
    - Changing thresholds updates instantly. Changing bands or gains recomputes the detection signal in
      the background on all CPU cores, which takes a fraction of a second per file.
 3. **Folder summary → Analyze folder** computes every file once. After that:
-   - Histograms of the compared values (IOI, SD, previous IOI) for every syllable in the folder, with
-     the current target's syllables in purple. Drag the amber lines to move each setpoint (thick) and
-     its ±eps (thin).
+   - **Editing:** one button per syllable with its count over the folder (★ = feedback target). The
+     syllable you pick is the one being edited, here and in the left panel.
+   - Its trigger type, window mode and enabled flag, and a *Make feedback target* button.
+   - Histograms of IOI, SD of the previous syllable and previous IOI for every syllable in the folder,
+     with the syllables classified as the edited one in purple. Drag the amber lines to move its window
+     (setpoint + eps, or min and max).
+   - **Duration** histogram of the syllables classified as the edited one (their own SD, which is not
+     part of the definition), with n, mean ± SD and CV. One narrow peak means the windows pick out a
+     single syllable type; a wide or double peak means a neighbouring syllable is getting through.
    - **IOI vs SD** scatter: each cluster is one syllable transition in the motif; the amber box is the
-     current target window.
-   - A per-file table of syllables / matches / blocked / feedback (click a row to open the file).
-     For a stereotyped motif you want about one match per motif rendition and none in files with no song.
-   - Threshold, setpoint and feedback changes re-run every file instantly. Band, gain and song-detector
+     edited syllable's window.
+   - A per-file table with counts for the edited syllable and the target, blocked matches and feedback
+     (click a row to open the file). For a stereotyped motif you want about one target per rendition
+     and none in files with no song.
+   - Threshold, syllable and feedback changes re-run every file instantly. Band, gain and song-detector
      changes need another *Analyze folder* (a warning appears).
 
 The offline analysis uses the same code as the real-time detector and is tested to produce bit-identical
@@ -80,6 +111,11 @@ results, including the random feedback draws for a given seed.
 
 Command line: `FeedbackPlease.exe bird42.ini --tune D:\songs\bird42 --analyze` opens straight into
 tuning. `make_test_wavs.exe <folder>` writes a dozen synthetic recordings to try it on.
+
+## How the live engine works
+
+See [docs/ENGINE.md](docs/ENGINE.md) for a schematic of the threads, one 1 ms frame, and the timing
+of a feedback event.
 
 ## How the LabVIEW code maps
 
@@ -89,7 +125,7 @@ tuning. `make_test_wavs.exe <folder>` writes a dozen synthetic recordings to try
 | `DetectBirdSong.vi` + STFT Spectrogram Record (song vs. calls/noise) | `SongDetector` (`src/core/SongDetector.cpp`), `ButterworthBandpass` (`src/core/Filters.cpp`) |
 | `DetectSyllables.vi`: mean subtract, software gain, power spectrum, *Spectrum to Amp Multibands*, band combination, to dB, low cutoff | `BandEnvelope` (`src/core/BandEnvelope.cpp`) |
 | *Syllable and IOI Time F(x)* (start/end thresholds, IOI, syllable duration) | `SyllableSegmenter` (`src/core/Syllables.cpp`) |
-| `CalcDetectSignal.vi` (trigger type, setpoints, eps, IOI n-1 / SD n-1 feedback nodes) | `SequenceMatcher` (`src/core/Syllables.cpp`) |
+| `CalcDetectSignal.vi` (trigger type, setpoints, eps, IOI n-1 / SD n-1 feedback nodes) and "All Sylls Dig Code" | `SyllableClassifier` (`src/core/SyllableCodes.cpp`) |
 | Feedback state machine (Listening, Triggered, Delay, Sending Trigger, Refractory Period) + "Simple Trigger Verification" amplitude check | `FeedbackStateMachine` (`src/core/FeedbackStateMachine.cpp`) |
 | DAQ I/O | `DaqBackend` (`src/io/DaqBackend.cpp`) |
 | Front panel | `Gui` (`src/app/Gui.cpp`) |
@@ -108,12 +144,37 @@ value    = include - subtract       (Band Combination = Difference; also Sum, Ra
 
 With 15 ms windows the bins are 66.7 Hz wide, so band edges are only accurate to about ±67 Hz.
 
-### Sequence matching
+### Syllables and the feedback target
 
-At syllable onsets A, B, C: at C's onset, **IOI** = C−B (Setpoint 1), **SD** = duration of B (Setpoint 2),
-**previous IOI** = B−A (Setpoint 3). `IOI, SD, IOI` checks all three, so a match means C is the target
-syllable. This follows the wiring in `CalcDetectSignal.vi`. `SD` and `IOI, SD` are evaluated at
-syllable offsets instead.
+Syllables are the centre of the app. Each one has a name, a U8 code (1–255), a **trigger type** and a
+window for each value it uses, given as **setpoint ± eps** or **min / max** (per syllable; switching
+converts the values). With onsets A, B, C, at C's onset (as wired in `CalcDetectSignal.vi`):
+
+| Value | Meaning | Used by |
+|---|---|---|
+| **IOI** | C − B, the interval ending now | IOI · SD, IOI · IOI, SD, IOI |
+| **SD** | duration of B, the previous syllable | SD, IOI · IOI, SD, IOI |
+| **Prev IOI** | B − A | IOI, SD, IOI |
+
+At every IOI end (each syllable onset after the first of a file/run) the list is checked **top to
+bottom** and the **first** syllable that matches is reported. Order matters when windows overlap; use
+the ▲▼ buttons.
+
+- **Feedback target** is a dropdown of the syllables (or *none*). Feedback is triggered when an IOI
+  end is classified as the target, so the target must be the first match. A broader syllable listed
+  above it takes precedence.
+- The matched syllable's code is written to the **Syllable code port** and counted ("All Sylls Count",
+  shown in each syllable's header while running, logged as `syllable` events). With no match, 0 is
+  written. *Write codes to port* turns the port off; classification and feedback keep running.
+- **Syllable code port** (Hardware): either an NI MAX task name such as `P2_SyllOut` (loaded with
+  `DAQmxLoadTask`, like the LabVIEW VI) or a port / line range such as `Dev2/port1` or
+  `Dev2/port1/line0:7` (written with `DAQmxWriteDigitalU8`).
+- **Hold**: *Until syllable ends* (default; the code is on the port while the matched syllable lasts,
+  my reading of the `= Timing Syllable` comparison), *Until next onset*, or a fixed *Pulse*.
+- Only the trigger types evaluated at an onset are offered, since the current syllable's own duration
+  isn't known yet at its IOI end.
+- **+ Add syllable** copies the syllable being edited. Settings files from before syllables existed
+  are converted on load: their target becomes a syllable called "target", which is selected.
 
 Note that measured durations include the detector's lag: the envelope stays above the end threshold
 for up to one window (≤15 ms) after a syllable ends, so measured SDs run long and gaps run short,
@@ -138,7 +199,7 @@ LabVIEW recomputes a whole spectrogram of the buffer every iteration and convolv
 box kernel; the streaming version gives the same value for the newest time point at a fraction of the cost.
 "time steps" is replaced by the column hop.
 
-With **Gate feedback on song** enabled (the default), a sequence match only starts a feedback
+With **Gate feedback on song** enabled (the default), a target match only starts a feedback
 trial while `song` is on. Blocked matches are logged as `match ... (blocked: no song)` and drawn as grey
 lines. The optional **Song line** DO is high while song is detected.
 
@@ -191,8 +252,8 @@ Please check these against the original VIs:
 - Zero-duration state transitions happen within one frame (LabVIEW spends one loop iteration
   per state, adding ~1 ms per hop between detection and Sending).
 - The random draw uses a seeded Mersenne Twister and every trial, catch trial and suppression is
-  logged with its sample index to `recordings/session_*_events.csv`, along with optional raw-audio and
-  envelope WAVs for offline checks.
+  logged with its sample index to `recordings/session_*_events.csv`, and each song is saved as its own
+  WAV with pre-roll (see *Recording*).
 - All processing happens on one time-critical thread; the GUI only reads snapshots, so redrawing
   plots cannot stall acquisition.
 - If the app crashes, it writes a stack trace to `feedbackplease_crash.txt`.

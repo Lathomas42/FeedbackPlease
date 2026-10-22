@@ -42,7 +42,7 @@ public:
     bool start(const AppParams& p, std::string& err) override {
         stop();
         fs_ = p.hw.sampleRate;
-        const bool ok = startAI(p, err) && startDO(p, err) && startAO(p, err) &&
+        const bool ok = startAI(p, err) && startDO(p, err) && startCode(p, err) && startAO(p, err) &&
                         check(DAQmxStartTask(ai_), "DAQmxStartTask(AI)", err);
         if (!ok) stop();
         return ok;
@@ -55,6 +55,14 @@ public:
             DAQmxClearTask(do_);
             do_ = 0;
         }
+        if (code_) {
+            writeSyllableCode(0);
+            DAQmxStopTask(code_);
+            DAQmxClearTask(code_);
+            code_ = 0;
+        }
+        // A stimulus cut short leaves the AO channel holding its last sample; drive it back to 0 V.
+        const bool aoMidStimulus = ao_ && aoBusy();
         for (TaskHandle* t : {&ai_, &ao_}) {
             if (*t) {
                 DAQmxStopTask(*t);
@@ -62,12 +70,21 @@ public:
                 *t = 0;
             }
         }
+        if (aoMidStimulus) zeroAO();
         doCount_ = 0;
         lastDo_ = DigitalOutputs{};
         aoLoaded_ = aoPending_ = 0;
         aoStarted_ = false;
         waves_[0].clear();
         waves_[1].clear();
+    }
+
+    void zeroAO() {
+        TaskHandle t = 0;
+        if (aoChannel_.empty() || DAQmxFailed(DAQmxCreateTask("FeedbackPlease_AOzero", &t))) return;
+        if (!DAQmxFailed(DAQmxCreateAOVoltageChan(t, aoChannel_.c_str(), "", aoMin_, aoMax_, DAQmx_Val_Volts, nullptr)))
+            DAQmxWriteAnalogScalarF64(t, 1, 1.0, 0.0, nullptr);
+        DAQmxClearTask(t);
     }
 
     double sampleRate() const override { return fs_; }
@@ -106,6 +123,14 @@ public:
         const int32 code = DAQmxWriteDigitalLines(do_, 1, 1, 0.1, DAQmx_Val_GroupByChannel, data, &written, nullptr);
         if (DAQmxFailed(code)) outErr_ = daqError(code, "DAQmxWriteDigitalLines");
         lastDo_ = d;
+    }
+
+    void writeSyllableCode(uint8_t code) override {
+        if (!code_) return;
+        uInt8 v = code;
+        int32 written = 0;
+        const int32 c = DAQmxWriteDigitalU8(code_, 1, 1, 0.1, DAQmx_Val_GroupByChannel, &v, &written, nullptr);
+        if (DAQmxFailed(c)) outErr_ = daqError(c, "DAQmxWriteDigitalU8 (syllable code)");
     }
 
     void armWave(int w) override {
@@ -160,11 +185,22 @@ private:
     bool startAI(const AppParams& p, std::string& err) {
         const auto& hw = p.hw;
         const uInt32 bufSamps = uInt32(std::max(hw.sampleRate * hw.inputBufferSec, 10.0 * hw.samplesPerFrame));
-        return check(DAQmxCreateTask("FeedbackPlease_AI", &ai_), "DAQmxCreateTask(AI)", err) &&
-               check(DAQmxCreateAIVoltageChan(ai_, hw.aiChannel.c_str(), "", toDaqTerminal(hw.terminalConfig),
-                                              hw.aiMin, hw.aiMax, DAQmx_Val_Volts, nullptr),
-                     "DAQmxCreateAIVoltageChan", err) &&
-               check(DAQmxCfgSampClkTiming(ai_, "", hw.sampleRate, DAQmx_Val_Rising, DAQmx_Val_ContSamps, bufSamps),
+        if (!check(DAQmxCreateTask("FeedbackPlease_AI", &ai_), "DAQmxCreateTask(AI)", err) ||
+            !check(DAQmxCreateAIVoltageChan(ai_, hw.aiChannel.c_str(), "", toDaqTerminal(hw.terminalConfig), hw.aiMin,
+                                            hw.aiMax, DAQmx_Val_Volts, nullptr),
+                   "DAQmxCreateAIVoltageChan", err))
+            return false;
+        // read() assumes exactly one channel (e.g. "Dev2/ai0", not "Dev2/ai0:1").
+        uInt32 nChans = 0;
+        DAQmxGetTaskNumChans(ai_, &nChans);
+        if (nChans != 1) {
+            err = "AI channel must be a single channel; '" + hw.aiChannel + "' has " + std::to_string(nChans);
+            return false;
+        }
+        // Move samples to the host as soon as any are in the device FIFO (lowest latency).
+        // Not every device supports this property, so failure is ignored.
+        DAQmxSetAIDataXferReqCond(ai_, "", DAQmx_Val_OnBrdMemNotEmpty);
+        return check(DAQmxCfgSampClkTiming(ai_, "", hw.sampleRate, DAQmx_Val_Rising, DAQmx_Val_ContSamps, bufSamps),
                      "DAQmxCfgSampClkTiming(AI)", err) &&
                check(DAQmxCfgInputBuffer(ai_, bufSamps), "DAQmxCfgInputBuffer", err) &&
                check(DAQmxGetSampClkRate(ai_, &fs_), "DAQmxGetSampClkRate", err);  // actual (coerced) rate
@@ -188,6 +224,24 @@ private:
         if (!check(DAQmxStartTask(do_), "DAQmxStartTask(DO)", err)) return false;
         lastDo_.feedback = !lastDo_.feedback;  // force the initial all-low write
         writeDigital(DigitalOutputs{});
+        return outErr_.empty() || (err = outErr_, false);
+    }
+
+    // Syllable code port: either a task saved in NI MAX (loaded by name, like LabVIEW's
+    // "P2_SyllOut") or a physical port / line range, e.g. "Dev2/port1" or "Dev2/port1/line0:7".
+    bool startCode(const AppParams& p, std::string& err) {
+        const std::string& spec = p.hw.sylCodeOutput;
+        if (spec.empty()) return true;
+        if (spec.find('/') == std::string::npos) {
+            if (!check(DAQmxLoadTask(spec.c_str(), &code_), "DAQmxLoadTask (syllable code task)", err)) return false;
+        } else {
+            if (!check(DAQmxCreateTask("FeedbackPlease_SylCode", &code_), "DAQmxCreateTask(code)", err) ||
+                !check(DAQmxCreateDOChan(code_, spec.c_str(), "", DAQmx_Val_ChanForAllLines), "DAQmxCreateDOChan(code)",
+                       err))
+                return false;
+        }
+        if (!check(DAQmxStartTask(code_), "DAQmxStartTask(syllable code)", err)) return false;
+        writeSyllableCode(0);
         return outErr_.empty() || (err = outErr_, false);
     }
 
@@ -218,6 +272,9 @@ private:
         for (auto& w : waves_)
             if (!w.empty()) w.resize(len, 0.0);
         aoLen_ = len;
+        aoChannel_ = hw.aoChannel;
+        aoMin_ = hw.aoMin;
+        aoMax_ = hw.aoMax;
 
         return check(DAQmxCreateTask("FeedbackPlease_AO", &ao_), "DAQmxCreateTask(AO)", err) &&
                check(DAQmxCreateAOVoltageChan(ao_, hw.aoChannel.c_str(), "", hw.aoMin, hw.aoMax, DAQmx_Val_Volts,
@@ -257,7 +314,7 @@ private:
         return true;
     }
 
-    TaskHandle ai_ = 0, do_ = 0, ao_ = 0;
+    TaskHandle ai_ = 0, do_ = 0, ao_ = 0, code_ = 0;
     double fs_ = 40000.0;
     std::vector<float64> buf_;
 
@@ -267,6 +324,8 @@ private:
 
     std::vector<float64> waves_[2];
     size_t aoLen_ = 0;
+    std::string aoChannel_;
+    double aoMin_ = -10.0, aoMax_ = 10.0;
     int aoLoaded_ = 0, aoPending_ = 0;
     bool aoStarted_ = false;
 

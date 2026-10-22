@@ -17,6 +17,7 @@
 
 #include "core/Detector.h"
 #include "core/Params.h"
+#include "core/SongRecorder.h"
 #include "core/WavFile.h"
 #include "io/IOBackend.h"
 
@@ -44,6 +45,11 @@ struct EngineStats {
     FbState fbState = FbState::Listening;
     uint64_t onsets = 0, matches = 0, blocked = 0, trials = 0, fires1 = 0, fires2 = 0, suppressed = 0, catches = 0;
     uint64_t songBouts = 0;
+    int songFilesDone = 0;      // song-triggered WAVs finished this session
+    bool songFileOpen = false;  // a song-triggered WAV is being written now
+    int currentCode = 0;               // value on the syllable code port now
+    std::vector<uint64_t> codeCounts;   // per entry of the syllable code list ("All Sylls Count")
+    uint64_t codeUnmatched = 0;         // IOI ends where no entry matched
     std::string sessionPrefix;
 };
 
@@ -66,22 +72,42 @@ struct ScopeSnapshot {
     std::vector<double> matchT, fireT, suppressT, blockedT;  // seconds, same clock as tEndSec
 };
 
-// Writes raw audio and envelope WAVs from a background thread so disk I/O never
-// stalls the acquisition loop.
+// Writes song-triggered WAVs, the envelope WAV and the events CSV from a background
+// thread so disk I/O never stalls the acquisition loop. The engine only queues data.
 class AsyncRecorder {
 public:
     ~AsyncRecorder() { close(); }
-    bool open(const std::string& rawPath, double rawRate, const std::string& envPath, double envRate);
-    void pushRaw(const float* x, size_t n);
+    // Empty envPath / eventsPath disable those outputs; songs == nullptr disables
+    // song-triggered files.
+    bool open(const std::string& envPath, double envRate, const std::string& eventsPath,
+              const SongFileConfig* songs, std::string* err);
+    // One frame for the song files: mic samples + the frame's detection value, marker
+    // level and song state.
+    void pushFrame(const float* mic, int n, float detection, float marker, bool song);
     void pushEnv(float v);
+    void pushEventLine(std::string line);  // one CSV row, without the newline
+    bool eventsOpen() const { return eventsOn_; }
+    int songFilesDone() const { return songs_.filesDone(); }
+    bool songRecording() const { return songs_.recording(); }
     void close();
 
 private:
+    struct FrameMeta {
+        float detection, marker;
+        bool song;
+    };
     void run();
-    WavWriter raw_, env_;
+    WavWriter env_;
+    SongFileWriter songs_;  // used only by the writer thread once it is running
+    bool songsOn_ = false;  // set before the thread starts
+    int frameN_ = 0;        // samples per frame (constant for a run)
+    std::ofstream events_;  // used only by the writer thread once it is running
+    bool eventsOn_ = false; // set before the thread starts; safe to read from the engine thread
     std::mutex mx_;
     std::condition_variable cv_;
-    std::vector<float> pendRaw_, pendEnv_;
+    std::vector<float> pendMic_, pendEnv_;
+    std::vector<FrameMeta> pendMeta_;
+    std::vector<std::string> pendLines_;
     bool stop_ = false;
     std::thread th_;
 };
@@ -151,7 +177,6 @@ private:
     std::string error_;
 
     // Engine-thread only.
-    std::ofstream eventsCsv_;
     AsyncRecorder recorder_;
 };
 

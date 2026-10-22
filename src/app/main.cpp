@@ -84,6 +84,12 @@ int main(int argc, char** argv) {
         if (!tuneFolder.empty()) gui.openTune(tuneFolder, analyze, summary);
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+            // Minimized: vsync no longer throttles the loop, so it would spin a core
+            // that the acquisition thread may need. Just wait for events instead.
+            if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
+                glfwWaitEventsTimeout(0.1);
+                continue;
+            }
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();

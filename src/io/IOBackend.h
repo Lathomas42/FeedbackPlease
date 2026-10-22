@@ -4,6 +4,7 @@
 // synthetic song in real time so the whole app can run without hardware.
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -39,6 +40,8 @@ public:
     virtual size_t backlog() { return 0; }
 
     virtual void writeDigital(const DigitalOutputs&) {}
+    // Syllable code port (U8). Only called when the value changes.
+    virtual void writeSyllableCode(uint8_t /*code*/) {}
     // Preload feedback waveform 1 or 2 so that fireWave() starts with minimal latency.
     virtual void armWave(int /*which*/) {}
     virtual void fireWave(int /*which*/) {}

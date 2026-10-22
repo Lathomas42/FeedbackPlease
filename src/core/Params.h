@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace fp {
 
@@ -44,6 +45,9 @@ struct HardwareParams {
     std::string doSyllableLine = "Dev1/port0/line1";  // high while a syllable is detected
     std::string doMatchLine = "Dev1/port0/line2";     // pulses when the target sequence matches
     std::string doSongLine;                           // high while song is detected (off by default)
+    // Syllable code output (U8): an NI MAX task name (e.g. "P2_SyllOut") or a port /
+    // line spec (e.g. "Dev2/port1"). Empty = off.
+    std::string sylCodeOutput;
 };
 
 struct SourceParams {
@@ -74,21 +78,8 @@ struct ProcessingParams {
     bool displayDb = true;  // display only; detection always uses the linear value
 };
 
-// Trigger-type and setpoint part of "Feedback Params" (CalcDetectSignal.vi).
-// Roles follow the wiring in CalcDetectSignal: Setpoint 1 is checked against the
-// IOI that just ended, Setpoint 2 against the most recent syllable duration and
-// Setpoint 3 against the IOI before that.
-struct SequenceParams {
-    TriggerType type = TriggerType::IOI_SD_IOI;
-    double ioiSetpointMs = 124.0;  // "Setpoint"
-    double ioiEpsMs = 10.0;        // "eps"
-    double sdSetpointMs = 95.0;    // "Setpoint 2"
-    double sdEpsMs = 10.0;         // "Eps 2"
-    double prevIoiSetpointMs = 95.0;  // "Setpoint 3"
-    double prevIoiEpsMs = 10.0;       // "eps 3"
-};
-
-// Feedback state machine part of "Feedback Params".
+// Feedback state machine part of "Feedback Params". What triggers it is the target
+// syllable, chosen in SyllableCodeParams::target.
 struct FeedbackParams {
     double prob1 = 1.0;
     double delay1Ms = 20.0;
@@ -142,6 +133,52 @@ struct SongParams {
     double holdSec = 0.0;         // keep "song" on this long after the detector drops
 };
 
+// ---- Syllables ("All Sylls Dig Code") and the feedback target
+// Each syllable has a trigger type saying which of IOI / SD / previous IOI it uses
+// (as in CalcDetectSignal.vi), and a window for each. At every IOI end (syllable
+// onset) the list is checked in order and the first match is reported. With onsets
+// A, B, C, at C's onset: IOI = C-B, SD = duration of B, previous IOI = B-A. Only the
+// onset-evaluated trigger types are used: IOI, "SD, IOI" and "IOI, SD, IOI".
+// Feedback fires when the first match is the target syllable.
+enum class SylCodeHold : int { UntilOffset = 0, UntilNextOnset = 1, Pulse = 2 };
+enum class RangeMode : int { SetpointEps = 0, MinMax = 1 };
+constexpr int kMaxCodes = 64;
+
+struct TimeWindow {
+    double setpointMs = 100.0;
+    double epsMs = 10.0;
+    double minMs = 90.0;
+    double maxMs = 110.0;
+    bool contains(double v, RangeMode m) const;  // false for NaN
+    void convertTo(RangeMode to);                 // keep the same window when switching mode
+};
+
+struct SyllableCode {
+    std::string name = "syllable";
+    int code = 1;  // value written to the port, 1..255 (0 = no match)
+    bool enabled = true;
+    TriggerType type = TriggerType::SD_IOI;
+    RangeMode mode = RangeMode::SetpointEps;
+    TimeWindow ioi, sd, prevIoi;
+};
+bool usesIoi(TriggerType t);
+bool usesSd(TriggerType t);
+bool usesPrevIoi(TriggerType t);
+bool isOnsetEvaluated(TriggerType t);  // IOI, SD_IOI, IOI_SD_IOI
+
+// The LabVIEW panel's target: "IOI, SD, IOI" with 124 / 95 / 95 ms +/- 10.
+SyllableCode defaultTargetSyllable();
+
+struct SyllableCodeParams {
+    bool enabled = true;  // write codes to the syllable code port (classification always runs)
+    SylCodeHold hold = SylCodeHold::UntilOffset;
+    double pulseMs = 5.0;  // for SylCodeHold::Pulse
+    std::vector<SyllableCode> list{defaultTargetSyllable()};
+    int target = 0;  // index into list that triggers feedback; -1 = none
+};
+// The target syllable, or nullptr if none / out of range.
+const SyllableCode* targetSyllable(const SyllableCodeParams& p);
+
 struct DisplayParams {
     double windowSec = 2.0;
     bool rawAutoY = true;
@@ -152,8 +189,16 @@ struct DisplayParams {
 struct RecordingParams {
     std::string outputDir = "recordings";
     bool saveEvents = true;    // CSV of onsets/offsets/matches/feedback
-    bool saveRaw = false;      // raw microphone WAV (float32)
-    bool saveEnvelope = false; // detection signal WAV at the frame rate
+    bool saveEnvelope = false; // continuous detection signal WAV at the frame rate
+
+    // Song-triggered WAVs: each time the song detector turns on, a new file starts with
+    // the last preRollSec of audio and continues until song has been off for postRollSec.
+    bool songFiles = true;
+    double preRollSec = 2.0;
+    double postRollSec = 2.0;
+    bool chMic = true;        // raw microphone (V)
+    bool chDetection = true;  // detection signal (linear), held over each frame
+    bool chMarkers = true;    // 0.1 song + 0.2 syllable + 0.3 target match + 0.4 feedback (the TTL lines)
 };
 
 struct AppParams {
@@ -161,9 +206,9 @@ struct AppParams {
     SourceParams source;
     SpectrumParams spectrum;
     ProcessingParams proc;
-    SequenceParams seq;
     FeedbackParams fb;
     SongParams song;
+    SyllableCodeParams codes;
     DisplayParams display;
     RecordingParams rec;
 };
@@ -179,5 +224,7 @@ const char* toString(Feedback2Mode m);
 const char* toString(SourceKind k);
 const char* toString(TerminalConfig t);
 const char* toString(SongRatioMode m);
+const char* toString(SylCodeHold h);
+const char* toString(RangeMode m);
 
 }  // namespace fp

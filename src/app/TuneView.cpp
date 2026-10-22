@@ -112,13 +112,23 @@ bool matchesAny(const std::string& patterns, const std::string& name) {
 
 std::string fileName(const std::string& path) { return fs::u8path(path).filename().u8string(); }
 
-// The three values CalcDetectSignal compares, as seen at syllable s for trigger type t.
+// The three values a syllable definition is checked against at syllable s's onset:
+// the IOI ending there, the previous syllable's duration, and the IOI before that.
 struct Compared {
     double ioi, sd, prevIoi;
 };
-Compared comparedValues(const SyllableInfo& s, TriggerType t) {
-    const bool sdIsOwn = t == TriggerType::SD || t == TriggerType::IOI_SD;
-    return {s.ioiMs, sdIsOwn ? s.sdMs : s.prevSdMs, s.prevIoiMs};
+Compared comparedValues(const SyllableInfo& s) { return {s.ioiMs, s.prevSdMs, s.prevIoiMs}; }
+
+// Moves a window so it is centred on v, keeping its width.
+void centreWindow(TimeWindow& w, RangeMode m, double v) {
+    v = std::round(v);
+    if (m == RangeMode::SetpointEps) {
+        w.setpointMs = v;
+    } else {
+        const double half = 0.5 * (w.maxMs - w.minMs);
+        w.minMs = v - half;
+        w.maxMs = v + half;
+    }
 }
 
 }  // namespace
@@ -158,6 +168,9 @@ void FileAnalyzer::publish(const std::shared_ptr<FileAnalysis>& a) {
 }
 
 void FileAnalyzer::run() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     for (;;) {
         Job job;
         {
@@ -234,6 +247,13 @@ void BatchAnalyzer::cancel() {
     running_ = false;
 }
 
+void BatchAnalyzer::clear() {
+    cancel();
+    std::lock_guard<std::mutex> lk(mx_);
+    entries_.clear();
+    ++version_;
+}
+
 void BatchAnalyzer::start(const std::vector<std::string>& files, const AppParams& p) {
     cancel();
     {
@@ -241,6 +261,7 @@ void BatchAnalyzer::start(const std::vector<std::string>& files, const AppParams
         entries_.clear();
         envKey_ = envelopeKey(p);
         songKey_ = songKey(p);
+        ++version_;
     }
     cancel_ = false;
     running_ = true;
@@ -249,6 +270,9 @@ void BatchAnalyzer::start(const std::vector<std::string>& files, const AppParams
 }
 
 void BatchAnalyzer::run(std::vector<std::string> files, AppParams p) {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
     for (size_t i = 0; i < files.size() && !cancel_; ++i) {
         BatchEntry e;
         e.path = files[i];
@@ -256,6 +280,7 @@ void BatchAnalyzer::run(std::vector<std::string> files, AppParams p) {
         if (!readWav(files[i], w, &e.error)) {
             std::lock_guard<std::mutex> lk(mx_);
             entries_.push_back(std::move(e));
+            ++version_;
             continue;
         }
         e.durationSec = w.samples.size() / w.sampleRate;
@@ -269,6 +294,7 @@ void BatchAnalyzer::run(std::vector<std::string> files, AppParams p) {
         {
             std::lock_guard<std::mutex> lk(mx_);
             entries_.push_back(std::move(e));
+            ++version_;
         }
         progress_ = float(i + 1) / float(files.size());
     }
@@ -300,6 +326,11 @@ void TuneView::scanFolder() {
     selected_ = -1;
     scanError_.clear();
     reqPath_.clear();
+    // Results from a previous folder would otherwise linger in the summary.
+    batch_.clear();
+    batchSummary_.clear();
+    batchSyllables_.clear();
+    batchDecCount_ = 0;
     std::error_code ec;
     const fs::path root = fs::u8path(folder_);
     if (!fs::is_directory(root, ec)) {
@@ -357,15 +388,16 @@ void TuneView::updateRequests(const AppParams& p) {
 void TuneView::updateDecisions(const AppParams& p, const FileAnalysis& a) {
     if (!a.env || !a.song) {
         dec_ = DecisionTrack{};
-        decEnv_ = decSong_ = nullptr;
+        decEnv_.reset();
+        decSong_.reset();
         return;
     }
     const uint64_t k = decisionKey(p);
-    if (k == decKey_ && a.env.get() == decEnv_ && a.song.get() == decSong_) return;
+    if (k == decKey_ && a.env == decEnv_ && a.song == decSong_) return;
     runDecisions(*a.env, *a.song, paramsForRate(p, a.sampleRate), dec_);
     decKey_ = k;
-    decEnv_ = a.env.get();
-    decSong_ = a.song.get();
+    decEnv_ = a.env;
+    decSong_ = a.song;
 }
 
 void TuneView::updateBatchDecisions(const AppParams& p) {
@@ -386,6 +418,9 @@ void TuneView::updateBatchDecisions(const AppParams& p) {
         s.matches = dt.matchMs.size();
         s.blocked = dt.blockedMs.size();
         s.fires = dt.fire1Ms.size() + dt.fire2Ms.size();
+        s.perCode.assign(p.codes.list.size(), 0);
+        for (const auto& syl : dt.syllables)
+            if (syl.codeIndex >= 0 && syl.codeIndex < int(s.perCode.size())) ++s.perCode[size_t(syl.codeIndex)];
         batchSyllables_.insert(batchSyllables_.end(), dt.syllables.begin(), dt.syllables.end());
     }
     batchDecKey_ = k;
@@ -393,7 +428,11 @@ void TuneView::updateBatchDecisions(const AppParams& p) {
     batchDecTime_ = now;
 }
 
-void TuneView::rebuildTexture(const Spectrogram& s) {
+void TuneView::rebuildTexture(const std::shared_ptr<const Spectrogram>& sp) {
+    texSpec_ = sp;  // remember it even if empty, so an empty result isn't retried every frame
+    texRange_ = specRange_;
+    texOffset_ = specOffset_;
+    const Spectrogram& s = *sp;
     if (s.cols == 0 || s.rows == 0) return;
     unsigned char lut[256][4];
     for (int i = 0; i < 256; ++i) {
@@ -420,14 +459,10 @@ void TuneView::rebuildTexture(const Spectrogram& s) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s.cols, s.rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-    texSpec_ = &s;
-    texRange_ = specRange_;
-    texOffset_ = specOffset_;
 }
 
-void TuneView::pickTarget(AppParams& p, double tMs) {
+int TuneView::syllableAt(double tMs) const {
     const auto& syl = dec_.syllables;
-    if (syl.empty()) return;
     // The syllable under the cursor, else the one with the nearest onset.
     int best = -1;
     for (int i = 0; i < int(syl.size()); ++i)
@@ -437,32 +472,82 @@ void TuneView::pickTarget(AppParams& p, double tMs) {
         for (int i = 0; i < int(syl.size()); ++i)
             if (std::fabs(syl[i].onsetMs - tMs) < bd) bd = std::fabs(syl[i].onsetMs - tMs), best = i;
     }
-    const auto c = comparedValues(syl[best], p.seq.type);
-    auto& q = p.seq;
-    const bool needIoi = q.type != TriggerType::SD, needSd = q.type != TriggerType::IOI,
-               needPrev = q.type == TriggerType::IOI_SD_IOI;
-    if ((needIoi && std::isnan(c.ioi)) || (needSd && std::isnan(c.sd)) || (needPrev && std::isnan(c.prevIoi))) {
-        status_ = "That syllable is too early in the bout to have all the intervals this trigger type needs.";
+    return best;
+}
+
+void TuneView::addCodeFromSyllable(AppParams& p, double tMs) {
+    const int i = syllableAt(tMs);
+    if (i < 0) return;
+    const auto& s = dec_.syllables[i];
+    if (std::isnan(s.ioiMs)) {
+        status_ = "That is the first syllable of the file; it has no IOI to classify on.";
         return;
     }
-    if (needIoi) q.ioiSetpointMs = std::round(c.ioi);
-    if (needSd) q.sdSetpointMs = std::round(c.sd);
-    if (needPrev) q.prevIoiSetpointMs = std::round(c.prevIoi);
+    if (int(p.codes.list.size()) >= kMaxCodes) return;
+    // Same definition the feedback target would get: "IOI, SD, IOI" when the history
+    // is long enough, otherwise the longest shorter type. Windows default to +/-10 ms.
+    SyllableCode c;
+    int code = 1;
+    for (const auto& x : p.codes.list) code = std::max(code, x.code + 1);
+    c.code = std::min(code, 255);
+    c.name = "syl" + std::to_string(p.codes.list.size() + 1);
+    c.type = !std::isnan(s.prevIoiMs) && !std::isnan(s.prevSdMs) ? TriggerType::IOI_SD_IOI
+             : !std::isnan(s.prevSdMs)                            ? TriggerType::SD_IOI
+                                                                  : TriggerType::IOI;
+    auto win = [](double v) {
+        TimeWindow w{std::isnan(v) ? 100.0 : std::round(v), 10.0, 0, 0};
+        w.convertTo(RangeMode::MinMax);
+        return w;
+    };
+    c.ioi = win(s.ioiMs);
+    c.sd = win(s.prevSdMs);
+    c.prevIoi = win(s.prevIoiMs);
+    p.codes.list.push_back(c);
+    *edit_ = int(p.codes.list.size()) - 1;  // edit the new syllable
     changed() = true;
     char buf[200];
-    std::snprintf(buf, sizeof buf, "Target set from syllable at %.3f s: IOI %.0f, SD %.0f, prev IOI %.0f ms", tMs / 1000.0,
-                  q.ioiSetpointMs, q.sdSetpointMs, q.prevIoiSetpointMs);
+    std::snprintf(buf, sizeof buf, "Added '%s' (code %d) from the syllable at %.3f s; it is now the syllable being "
+                  "edited.", c.name.c_str(), c.code, s.onsetMs / 1000.0);
     status_ = buf;
 }
 
-void TuneView::draw(AppParams& p) {
+void TuneView::setEditedFromSyllable(AppParams& p, double tMs) {
+    const int best = syllableAt(tMs);
+    if (best < 0) return;
+    if (*edit_ < 0 || *edit_ >= int(p.codes.list.size())) {
+        status_ = "No syllable selected for editing; Ctrl+Shift+click adds a new one.";
+        return;
+    }
+    SyllableCode& e = p.codes.list[size_t(*edit_)];
+    const auto c = comparedValues(dec_.syllables[best]);
+    if ((usesIoi(e.type) && std::isnan(c.ioi)) || (usesSd(e.type) && std::isnan(c.sd)) ||
+        (usesPrevIoi(e.type) && std::isnan(c.prevIoi))) {
+        status_ = "That syllable is too early in the bout to have all the intervals '" + e.name + "' uses.";
+        return;
+    }
+    // Centre the windows on this syllable's values, keeping their widths.
+    if (usesIoi(e.type)) centreWindow(e.ioi, e.mode, c.ioi);
+    if (usesSd(e.type)) centreWindow(e.sd, e.mode, c.sd);
+    if (usesPrevIoi(e.type)) centreWindow(e.prevIoi, e.mode, c.prevIoi);
+    changed() = true;
+    char buf[220];
+    std::snprintf(buf, sizeof buf, "'%s' centred on the syllable at %.3f s: IOI %.0f, SD %.0f, prev IOI %.0f ms",
+                  e.name.c_str(), tMs / 1000.0, c.ioi, c.sd, c.prevIoi);
+    status_ = buf;
+}
+
+void TuneView::draw(AppParams& p, int& editSyllable) {
+    edit_ = &editSyllable;
     drawBrowser(p);
     updateRequests(p);
 
     // Results from the background analyses.
     if (auto r = analyzer_.result(); r && selected_ >= 0 && selected_ < int(files_.size()) && r->path == files_[selected_])
         shown_ = r;
-    batch_.results(batchEntries_, batchEnvKey_, batchSongKey_);
+    if (batch_.version() != batchVersion_) {  // copy only when the batch results changed
+        batchVersion_ = batch_.version();
+        batch_.results(batchEntries_, batchEnvKey_, batchSongKey_);
+    }
     if (!batchEntries_.empty()) updateBatchDecisions(p);  // keeps the per-file counts in the list current
 
     ImGui::BeginChild("filelist", ImVec2(22.0f * em(), 0), ImGuiChildFlags_Border);
@@ -593,6 +678,8 @@ void TuneView::drawFileView(AppParams& p) {
     ImGui::SameLine();
     ImGui::Checkbox("Feedback", &showFeedback_);
     ImGui::SameLine();
+    ImGui::Checkbox("Codes", &showCodes_);
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(5.0f * em());
     if (ImGui::BeginCombo("window", std::to_string(specWindow_).c_str())) {
         for (int w : {256, 512, 1024, 2048})
@@ -609,8 +696,8 @@ void TuneView::drawFileView(AppParams& p) {
     ImGui::SetNextItemWidth(5.0f * em());
     ImGui::InputDouble("max Hz", &specMaxHz_, 0, 0, "%.0f");
     specMaxHz_ = std::clamp(specMaxHz_, 1000.0, 50000.0);
-    ImGui::TextDisabled("Drag the green/red lines to change thresholds and band edges. Ctrl+click a syllable to make "
-                        "it the target. PageUp/PageDown change file.");
+    ImGui::TextDisabled("Drag the green/red lines to change thresholds and band edges. Ctrl+click a syllable: centre "
+                        "the edited syllable on it. Ctrl+Shift+click: add a new syllable. PageUp/PageDown change file.");
     if (!status_.empty()) {
         ImGui::SameLine();
         ImGui::TextColored(kPurple, "%s", status_.c_str());
@@ -647,8 +734,8 @@ void TuneView::drawFileView(AppParams& p) {
     };
 
     // ---- spectrogram with draggable band edges
-    if (a->spec && (texSpec_ != a->spec.get() || texRange_ != specRange_ || texOffset_ != specOffset_))
-        rebuildTexture(*a->spec);
+    if (a->spec && (texSpec_ != a->spec || texRange_ != specRange_ || texOffset_ != specOffset_))
+        rebuildTexture(a->spec);
     // Aligned so the three time axes line up even though they have different axis labels.
     ImPlot::BeginAlignedPlots("tunefile");
     if (ImPlot::BeginPlot("##spectrogram", ImVec2(-1, specH), ImPlotFlags_NoLegend | ImPlotFlags_NoMenus)) {
@@ -755,6 +842,9 @@ void TuneView::drawFileView(AppParams& p) {
                 if (showIOI_ && !std::isnan(s.ioiMs))
                     ImPlot::Annotation(t, lim.Y.Max, s.matched ? kPurple : kCyan, ImVec2(0, 28), true, "%.0f",
                                        s.ioiMs);
+                if (showCodes_ && s.codeIndex >= 0 && s.codeIndex < int(p.codes.list.size()))
+                    ImPlot::Annotation(t, lim.Y.Max, s.codeIndex == *edit_ ? kAmber : kGreen, ImVec2(0, 46), true,
+                                       "%s", p.codes.list[s.codeIndex].name.c_str());
             }
         }
 
@@ -763,13 +853,26 @@ void TuneView::drawFileView(AppParams& p) {
             const double tMs = ImPlot::GetPlotMousePos().x * 1000.0;
             for (const auto& s : dec_.syllables)
                 if (tMs >= s.onsetMs && (std::isnan(s.offsetMs) || tMs <= s.offsetMs)) {
-                    ImGui::SetTooltip("onset %.3f s\nSD %.0f ms\nIOI %.0f ms\nprev SD %.0f ms\nprev IOI %.0f ms%s\n"
-                                      "Ctrl+click: make this the target",
-                                      s.onsetMs / 1000.0, s.sdMs, s.ioiMs, s.prevSdMs, s.prevIoiMs,
-                                      s.matched ? "\nMATCHES current setpoints" : "");
+                    const std::string code =
+                        s.codeIndex >= 0 && s.codeIndex < int(p.codes.list.size())
+                            ? "\ncode: " + p.codes.list[s.codeIndex].name + " (" + std::to_string(s.code) + ")"
+                            : std::string();
+                    const std::string editing = *edit_ >= 0 && *edit_ < int(p.codes.list.size())
+                                                    ? p.codes.list[size_t(*edit_)].name
+                                                    : std::string("(none)");
+                    ImGui::SetTooltip("onset %.3f s\nSD %.0f ms\nIOI %.0f ms\nprev SD %.0f ms\nprev IOI %.0f ms%s%s\n"
+                                      "Ctrl+click: centre '%s' on this syllable\n"
+                                      "Ctrl+Shift+click: add it as a new syllable",
+                                      s.onsetMs / 1000.0, s.sdMs, s.ioiMs, s.prevSdMs, s.prevIoiMs, code.c_str(),
+                                      s.matched ? "\n= feedback target" : "", editing.c_str());
                     break;
                 }
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetIO().KeyCtrl) pickTarget(p, tMs);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetIO().KeyCtrl) {
+                if (ImGui::GetIO().KeyShift)
+                    addCodeFromSyllable(p, tMs);
+                else
+                    setEditedFromSyllable(p, tMs);
+            }
         }
         ImPlot::EndPlot();
     }
@@ -861,29 +964,100 @@ void TuneView::drawFolderSummary(AppParams& p) {
             withMatch += s.matches > 0;
         }
     }
-    ImGui::Text("%zu files, %.1f min of audio  |  %zu syllables  |  %zu matches in %zu files (%.1f%%)  |  %zu blocked "
-                "by song gate  |  %zu feedback%s",
-                files, seconds / 60.0, syl, matches, withMatch, files ? 100.0 * withMatch / files : 0.0, blocked, fires,
+    const SyllableCode* tgt = targetSyllable(p.codes);
+    ImGui::Text("%zu files, %.1f min of audio  |  %zu syllables  |  target '%s': %zu matches in %zu files (%.1f%%)  |  "
+                "%zu blocked by song gate  |  %zu feedback%s",
+                files, seconds / 60.0, syl, tgt ? tgt->name.c_str() : "none", matches, withMatch,
+                files ? 100.0 * withMatch / files : 0.0, blocked, fires,
                 errors ? "  |  some files could not be read" : "");
 
-    // ---- distributions of the values CalcDetectSignal compares
-    const TriggerType type = p.seq.type;
-    std::vector<double> ioiAll, ioiM, sdAll, sdM, prevAll, prevM, scatX, scatY, scatMX, scatMY;
+    // ---- choose the syllable being edited (counts = first matches across the folder)
+    auto& list = p.codes.list;
+    std::vector<size_t> perCode(list.size(), 0);
+    size_t none = 0;
     for (const auto& s : batchSyllables_) {
-        const auto c = comparedValues(s, type);
-        if (!std::isnan(c.ioi) && c.ioi < 1000) (s.matched ? ioiM : ioiAll).push_back(c.ioi);
-        if (!std::isnan(c.sd) && c.sd < 1000) (s.matched ? sdM : sdAll).push_back(c.sd);
-        if (!std::isnan(c.prevIoi) && c.prevIoi < 1000) (s.matched ? prevM : prevAll).push_back(c.prevIoi);
+        if (std::isnan(s.ioiMs)) continue;  // no IOI end -> not classified
+        if (s.codeIndex >= 0 && s.codeIndex < int(perCode.size()))
+            ++perCode[size_t(s.codeIndex)];
+        else
+            ++none;
+    }
+    if (list.empty()) {
+        ImGui::TextDisabled("No syllables yet: Ctrl+Shift+click a syllable in the File view, or use '+ Add syllable' "
+                            "in the Syllables panel.");
+        return;
+    }
+    *edit_ = std::clamp(*edit_, 0, int(list.size()) - 1);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Editing:");
+    for (int i = 0; i < int(list.size()); ++i) {
+        const std::string label = std::string(i == p.codes.target ? "* " : "") + list[i].name + " (" +
+                                  std::to_string(list[i].code) + "): " + std::to_string(perCode[i]) + "##ed" +
+                                  std::to_string(i);
+        const float w = ImGui::CalcTextSize(label.c_str(), nullptr, true).x + 2 * ImGui::GetStyle().FramePadding.x;
+        ImGui::SameLine();
+        if (ImGui::GetContentRegionAvail().x < w) ImGui::NewLine();
+        const bool sel = i == *edit_;
+        if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.50f, 0.10f, 1.0f));
+        if (ImGui::Button(label.c_str())) *edit_ = i;
+        if (sel) ImGui::PopStyleColor();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("  no match: %zu", none);
+    HelpMarker("Counts are first matches over the whole folder; * = feedback target. Pick the syllable to edit; the "
+               "plots below show and drag its windows. Ctrl+click in the File view centres it on a syllable.");
+
+    SyllableCode& e = list[size_t(*edit_)];
+    ImGui::PushID("editsyl");
+    ImGui::SetNextItemWidth(8 * em());
+    if (ImGui::BeginCombo("##type", toString(e.type))) {
+        for (TriggerType t : {TriggerType::IOI, TriggerType::SD_IOI, TriggerType::IOI_SD_IOI})
+            if (ImGui::Selectable(toString(t), t == e.type)) {
+                e.type = t;
+                changed() = true;
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    const RangeMode before = e.mode;
+    if (EnumCombo("##mode", &e.mode, 2, 11) && e.mode != before)
+        for (TimeWindow* w : {&e.ioi, &e.sd, &e.prevIoi}) w->convertTo(e.mode);
+    ImGui::SameLine();
+    Check("enabled", &e.enabled);
+    ImGui::SameLine();
+    if (*edit_ == p.codes.target) {
+        ImGui::TextColored(kPurple, "  this is the feedback target");
+    } else if (ImGui::Button("Make feedback target")) {
+        p.codes.target = *edit_;
+        changed() = true;
+    }
+    ImGui::PopID();
+
+    // ---- distributions of the values the edited syllable is checked against
+    const bool minMax = e.mode == RangeMode::MinMax;
+    std::vector<double> ioiAll, ioiM, sdAll, sdM, prevAll, prevM, scatX, scatY, scatMX, scatMY, durAll, durM;
+    for (const auto& s : batchSyllables_) {
+        const auto c = comparedValues(s);
+        const bool mine = s.codeIndex == *edit_;
+        // The classified syllable's own duration (NaN if a file ends mid-syllable).
+        if (!std::isnan(s.sdMs) && s.sdMs < 1000) (mine ? durM : durAll).push_back(s.sdMs);
+        if (!std::isnan(c.ioi) && c.ioi < 1000) (mine ? ioiM : ioiAll).push_back(c.ioi);
+        if (!std::isnan(c.sd) && c.sd < 1000) (mine ? sdM : sdAll).push_back(c.sd);
+        if (!std::isnan(c.prevIoi) && c.prevIoi < 1000) (mine ? prevM : prevAll).push_back(c.prevIoi);
         if (!std::isnan(c.ioi) && !std::isnan(c.sd) && c.ioi < 1000 && c.sd < 1000) {
-            (s.matched ? scatMX : scatX).push_back(c.ioi);
-            (s.matched ? scatMY : scatY).push_back(c.sd);
+            (mine ? scatMX : scatX).push_back(c.ioi);
+            (mine ? scatMY : scatY).push_back(c.sd);
         }
     }
     const float histH = std::max(8.0f * em(), ImGui::GetContentRegionAvail().y * 0.38f);
-    const float w3 = (ImGui::GetContentRegionAvail().x - 3 * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
+    const float w3 = (ImGui::GetContentRegionAvail().x - 4 * ImGui::GetStyle().ItemSpacing.x) / 5.0f;
     int dragId = 300;
-    auto hist = [&](const char* title, const std::vector<double>& all, const std::vector<double>& m, double* sp,
-                    double* eps, bool used) {
+    auto bounds = [&](const TimeWindow& w) {
+        return minMax ? std::pair<double, double>{w.minMs, w.maxMs}
+                      : std::pair<double, double>{w.setpointMs - w.epsMs, w.setpointMs + w.epsMs};
+    };
+    auto hist = [&](const char* title, const std::vector<double>& all, const std::vector<double>& m, TimeWindow& w,
+                    bool used) {
         if (!ImPlot::BeginPlot(title, ImVec2(w3, histH), ImPlotFlags_NoMenus | ImPlotFlags_NoLegend)) return;
         ImPlot::SetupAxes("ms", "count", 0, ImPlotAxisFlags_AutoFit);
         ImPlot::SetupAxisLimits(ImAxis_X1, 0, 400, ImPlotCond_Once);
@@ -894,59 +1068,107 @@ void TuneView::drawFolderSummary(AppParams& p) {
         }
         if (!m.empty()) {
             ImPlot::SetNextFillStyle(kPurple, 0.9f);
-            ImPlot::PlotHistogram("target", m.data(), int(m.size()), 500, 1.0, range);
+            ImPlot::PlotHistogram("this syllable", m.data(), int(m.size()), 500, 1.0, range);
         }
         if (used) {
-            const ImVec4 c = kAmber;
-            double lo = *sp - *eps, hi = *sp + *eps;
-            ImPlot::SetNextLineStyle(ImVec4(c.x, c.y, c.z, 0.5f), 1.0f);
-            ImPlot::PlotInfLines("##lo", &lo, 1);
-            if (ImPlot::DragLineX(dragId, sp, c, 2.0f)) changed() = true;
-            if (ImPlot::DragLineX(dragId + 1, &hi, ImVec4(c.x, c.y, c.z, 0.6f), 1.0f)) {
-                *eps = std::max(0.5, hi - *sp);
-                changed() = true;
+            const ImVec4 c = kAmber, faint(c.x, c.y, c.z, 0.6f);
+            if (minMax) {
+                if (ImPlot::DragLineX(dragId, &w.minMs, c, 2.0f)) {
+                    w.minMs = std::min(w.minMs, w.maxMs);
+                    changed() = true;
+                }
+                if (ImPlot::DragLineX(dragId + 1, &w.maxMs, c, 2.0f)) {
+                    w.maxMs = std::max(w.maxMs, w.minMs);
+                    changed() = true;
+                }
+            } else {
+                double lo = w.setpointMs - w.epsMs, hi = w.setpointMs + w.epsMs;
+                ImPlot::SetNextLineStyle(faint, 1.0f);
+                ImPlot::PlotInfLines("##lo", &lo, 1);
+                if (ImPlot::DragLineX(dragId, &w.setpointMs, c, 2.0f)) changed() = true;
+                if (ImPlot::DragLineX(dragId + 1, &hi, faint, 1.0f)) {
+                    w.epsMs = std::max(0.5, hi - w.setpointMs);
+                    changed() = true;
+                }
             }
+        } else {
+            ImPlot::Annotation(200, 0, kGrey, ImVec2(0, -20), true, "not used by %s", toString(e.type));
         }
         dragId += 2;
         ImPlot::EndPlot();
     };
-    auto& q = p.seq;
-    const bool sdOwn = type == TriggerType::SD || type == TriggerType::IOI_SD;
-    hist("IOI (Setpoint 1)", ioiAll, ioiM, &q.ioiSetpointMs, &q.ioiEpsMs, type != TriggerType::SD);
+    hist("IOI", ioiAll, ioiM, e.ioi, usesIoi(e.type));
     ImGui::SameLine();
-    hist(sdOwn ? "SD of this syllable (Setpoint 2)" : "SD of previous syllable (Setpoint 2)", sdAll, sdM,
-         &q.sdSetpointMs, &q.sdEpsMs, type != TriggerType::IOI);
+    hist("SD of previous syllable", sdAll, sdM, e.sd, usesSd(e.type));
     ImGui::SameLine();
-    hist("Previous IOI (Setpoint 3)", prevAll, prevM, &q.prevIoiSetpointMs, &q.prevIoiEpsMs,
-         type == TriggerType::IOI_SD_IOI);
+    hist("Previous IOI", prevAll, prevM, e.prevIoi, usesPrevIoi(e.type));
     ImGui::SameLine();
-    if (ImPlot::BeginPlot("IOI vs SD", ImVec2(w3, histH), ImPlotFlags_NoMenus | ImPlotFlags_NoLegend)) {
+
+    // Durations of the syllables classified as this one. Not part of the definition
+    // (it is only known after the syllable ends), but a tight single peak is a good
+    // sign the windows pick out one syllable type; a wide or double peak means a
+    // neighbouring syllable is getting through.
+    {
+        double mean = 0.0, sd = 0.0;
+        for (double d : durM) mean += d;
+        if (!durM.empty()) mean /= double(durM.size());
+        for (double d : durM) sd += (d - mean) * (d - mean);
+        if (durM.size() > 1) sd = std::sqrt(sd / double(durM.size() - 1));
+        const std::string title = "Duration of '" + e.name + "'###dur";
+        if (ImPlot::BeginPlot(title.c_str(), ImVec2(w3, histH), ImPlotFlags_NoMenus | ImPlotFlags_NoLegend)) {
+            ImPlot::SetupAxes("ms", "count", 0, ImPlotAxisFlags_AutoFit);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, 300, ImPlotCond_Once);
+            const ImPlotRange range(0, 1000);
+            if (!durAll.empty()) {
+                ImPlot::SetNextFillStyle(kGrey, 0.35f);
+                ImPlot::PlotHistogram("all", durAll.data(), int(durAll.size()), 1000, 1.0, range);
+            }
+            if (!durM.empty()) {
+                ImPlot::SetNextFillStyle(kPurple, 0.9f);
+                ImPlot::PlotHistogram("this syllable", durM.data(), int(durM.size()), 1000, 1.0, range);
+                ImPlot::SetNextLineStyle(kAmber, 1.0f);
+                ImPlot::PlotInfLines("mean", &mean, 1);
+            }
+            // Stats in the top-right corner (clamped inside the plot).
+            const ImPlotRect lim = ImPlot::GetPlotLimits();
+            if (durM.empty())
+                ImPlot::Annotation(lim.X.Max, lim.Y.Max, kGrey, ImVec2(-4, 4), true, "none classified");
+            else
+                ImPlot::Annotation(lim.X.Max, lim.Y.Max, kPurple, ImVec2(-4, 4), true,
+                                   "n = %zu\n%.1f +/- %.1f ms\nCV %.0f%%", durM.size(), mean, sd,
+                                   mean > 0 ? 100.0 * sd / mean : 0.0);
+            ImPlot::EndPlot();
+        }
+    }
+    ImGui::SameLine();
+    if (ImPlot::BeginPlot("IOI vs SD of previous", ImVec2(w3, histH), ImPlotFlags_NoMenus | ImPlotFlags_NoLegend)) {
         ImPlot::SetupAxes("IOI ms", "SD ms", 0, 0);
         ImPlot::SetupAxesLimits(0, 400, 0, 300, ImPlotCond_Once);
         ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f, ImVec4(0.75f, 0.75f, 0.75f, 0.7f), 0.0f);
         if (!scatX.empty()) ImPlot::PlotScatter("all", scatX.data(), scatY.data(), int(scatX.size()));
         ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 4.0f, kPurple, 0.0f);
-        if (!scatMX.empty()) ImPlot::PlotScatter("target", scatMX.data(), scatMY.data(), int(scatMX.size()));
-        const double bx[5] = {q.ioiSetpointMs - q.ioiEpsMs, q.ioiSetpointMs + q.ioiEpsMs,
-                              q.ioiSetpointMs + q.ioiEpsMs, q.ioiSetpointMs - q.ioiEpsMs, q.ioiSetpointMs - q.ioiEpsMs};
-        const double by[5] = {q.sdSetpointMs - q.sdEpsMs, q.sdSetpointMs - q.sdEpsMs, q.sdSetpointMs + q.sdEpsMs,
-                              q.sdSetpointMs + q.sdEpsMs, q.sdSetpointMs - q.sdEpsMs};
+        if (!scatMX.empty()) ImPlot::PlotScatter("this syllable", scatMX.data(), scatMY.data(), int(scatMX.size()));
+        // The window as a box (an unused SD spans the whole axis).
+        const auto [x0, x1] = bounds(e.ioi);
+        const auto [y0, y1] = usesSd(e.type) ? bounds(e.sd) : std::pair<double, double>{0.0, 1000.0};
+        const double bx[5] = {x0, x1, x1, x0, x0}, by[5] = {y0, y0, y1, y1, y0};
         ImPlot::SetNextLineStyle(kAmber, 1.5f);
-        ImPlot::PlotLine("box", bx, by, 5);
+        ImPlot::PlotLine("window", bx, by, 5);
         ImPlot::EndPlot();
     }
-    ImGui::TextDisabled("Grey = all syllables, purple = syllables that match the current target. Drag the amber lines "
-                        "to move a setpoint (thick) or its +/- eps (thin). Each cluster in 'IOI vs SD' is one syllable "
-                        "transition in the motif.");
+    ImGui::TextDisabled("Grey = all syllables, purple = syllables classified as '%s' (first match). Drag the amber "
+                        "lines to move %s. 'Duration' should be one narrow peak if only one syllable type is caught.",
+                        e.name.c_str(), minMax ? "min / max" : "the setpoint (thick) or +/- eps (thin)");
 
     // ---- per-file table
-    if (ImGui::BeginTable("batchfiles", 6,
+    if (ImGui::BeginTable("batchfiles", 7,
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                               ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("file", ImGuiTableColumnFlags_WidthStretch);
-        for (const char* c : {"sec", "syllables", "matches", "blocked", "feedback"})
-            ImGui::TableSetupColumn(c, ImGuiTableColumnFlags_WidthFixed, 5.0f * em());
+        const std::string editedCol = "'" + e.name + "'";
+        for (const char* c : {"sec", "syllables", editedCol.c_str(), "target", "blocked", "feedback"})
+            ImGui::TableSetupColumn(c, ImGuiTableColumnFlags_WidthFixed, 5.5f * em());
         ImGui::TableHeadersRow();
         ImGuiListClipper clip;
         clip.Begin(int(batchEntries_.size()));
@@ -975,6 +1197,9 @@ void TuneView::drawFolderSummary(AppParams& p) {
                 ImGui::Text("%.1f", e.durationSec);
                 ImGui::TableNextColumn();
                 ImGui::Text("%zu", s.syllables);
+                ImGui::TableNextColumn();
+                const size_t mine = *edit_ < int(s.perCode.size()) ? s.perCode[size_t(*edit_)] : 0;
+                ImGui::TextColored(mine ? kAmber : kGrey, "%zu", mine);
                 ImGui::TableNextColumn();
                 ImGui::TextColored(s.matches ? kPurple : kGrey, "%zu", s.matches);
                 ImGui::TableNextColumn();

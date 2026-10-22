@@ -5,6 +5,11 @@
 #include <cstring>
 #include <thread>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include "core/BandEnvelope.h"
 #include "core/Detector.h"
 #include "core/SongDetector.h"
@@ -36,6 +41,10 @@ bool computeEnvelopeTrack(const std::vector<float>& x, const AppParams& pr, Enve
     // Each frame's value depends only on the N samples ending at that frame, so frames
     // can be computed independently. Same BandEnvelope code as real time => same numbers.
     auto worker = [&](size_t k0, size_t k1) {
+#ifdef _WIN32
+        // Tuning can run while acquiring live: never compete with the engine thread.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
         BandEnvelope env;
         env.configure(pr.hw.sampleRate, N, pr.spectrum, pr.proc);
         for (size_t k = k0; k < k1; ++k) {
@@ -109,6 +118,10 @@ void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const AppPara
                 s.prevIoiMs = out.syllables.back().ioiMs;
                 s.prevSdMs = out.syllables.back().sdMs;
             }
+            if (r.sylCode.evaluated) {
+                s.codeIndex = r.sylCode.index;
+                s.code = r.sylCode.code;
+            }
             out.syllables.push_back(s);
         }
         if (r.match.match) {
@@ -159,13 +172,16 @@ uint64_t songKey(const AppParams& p) {
 uint64_t decisionKey(const AppParams& p) {
     Hasher h;
     h << p.spectrum.sylStartThresh << p.spectrum.sylEndThresh;
-    const auto& q = p.seq;
-    h << int(q.type) << q.ioiSetpointMs << q.ioiEpsMs << q.sdSetpointMs << q.sdEpsMs << q.prevIoiSetpointMs
-      << q.prevIoiEpsMs;
+    h << p.codes.target;
     const auto& f = p.fb;
     h << f.enabled << f.prob1 << f.delay1Ms << f.thresh1 << f.prob2 << f.delay2Ms << f.thresh2 << int(f.mode2)
       << f.refractoryMs << f.extraDelayMs;
     h << p.song.enabled << p.song.gateFeedback;
+    h << p.codes.enabled << int(p.codes.list.size());
+    for (const auto& c : p.codes.list) {
+        h << c.enabled << c.code << int(c.type) << int(c.mode);
+        for (const TimeWindow* w : {&c.ioi, &c.sd, &c.prevIoi}) h << w->setpointMs << w->epsMs << w->minMs << w->maxMs;
+    }
     return h.h;
 }
 

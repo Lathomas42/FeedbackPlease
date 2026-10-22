@@ -43,6 +43,8 @@ struct SyllableInfo {
     double prevIoiMs = kNaN;  // the previous syllable's IOI
     double prevSdMs = kNaN;   // the previous syllable's duration
     bool matched = false;     // the target sequence matched at this syllable
+    int codeIndex = -1;       // first matching entry of the syllable code list, -1 if none
+    int code = 0;             // its U8 code
 };
 
 struct DecisionTrack {

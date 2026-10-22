@@ -63,6 +63,7 @@ void Gui::pushParams() {
 
 void Gui::draw() {
     changed() = false;
+    stats_ = engine_.stats();  // one locked copy per frame
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
@@ -87,7 +88,7 @@ void Gui::draw() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Tune on recordings", nullptr, selectTuneTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
-            tune_.draw(p_);
+            tune_.draw(p_, editSyl_);
             ImGui::EndTabItem();
         }
         selectTuneTab_ = false;
@@ -176,10 +177,13 @@ void Gui::drawToolbar() {
 
 void Gui::drawControls() {
     const ImGuiTreeNodeFlags open = ImGuiTreeNodeFlags_DefaultOpen;
-    if (ImGui::CollapsingHeader("Spectrum Selection", open)) drawSpectrum();
-    if (ImGui::CollapsingHeader("Processing Params", open)) drawProcessing();
-    if (ImGui::CollapsingHeader("Target Sequence", open)) drawSequence();
-    if (ImGui::CollapsingHeader("Song Detection (DetectBirdSong)", open)) drawSong();
+    if (ImGui::CollapsingHeader("Syllables & Target", open)) {
+        drawTarget();
+        drawCodes();
+    }
+    if (ImGui::CollapsingHeader("Spectrum Selection")) drawSpectrum();
+    if (ImGui::CollapsingHeader("Processing Params")) drawProcessing();
+    if (ImGui::CollapsingHeader("Song Detection (DetectBirdSong)")) drawSong();
     if (ImGui::CollapsingHeader("Feedback", open)) drawFeedback();
     if (ImGui::CollapsingHeader("Hardware / Source")) drawHardware();
     if (ImGui::CollapsingHeader("Recording")) drawRecording();
@@ -225,6 +229,10 @@ void Gui::drawHardware() {
     HelpMarker("Pulses when the target sequence matches, whether or not feedback follows (catch trials, refractory, no song).");
     InputStr("Song line", &p_.hw.doSongLine, 12);
     HelpMarker("High while the song detector says the bird is singing. Empty = off.");
+    InputStr("Syllable code port", &p_.hw.sylCodeOutput, 12);
+    HelpMarker("Where the matched syllable's U8 code is written. Either the name of a task saved in NI MAX "
+               "(e.g. P2_SyllOut, like the LabVIEW VI) or a port / lines, e.g. Dev2/port1 or Dev2/port1/line0:7. "
+               "Empty = off.");
 
     ImGui::SeparatorText("Simulated source");
     PathInput("Song WAV", &p_.source.simWavPath);
@@ -237,7 +245,7 @@ void Gui::drawHardware() {
 void Gui::drawSpectrum() {
     InputD("# previous ms included in calcs", &p_.spectrum.windowMs, "%.3g");
     p_.spectrum.windowMs = std::clamp(p_.spectrum.windowMs, 1.0, 200.0);
-    const double fs = engine_.running() ? engine_.stats().sampleRate : p_.hw.sampleRate;
+    const double fs = stats_.running ? stats_.sampleRate : p_.hw.sampleRate;
     const double n = std::round(p_.spectrum.windowMs * fs / 1000.0);
     ImGui::TextDisabled("%.0f samples, %.1f Hz bins", n, fs / std::max(1.0, n));
 
@@ -293,40 +301,30 @@ void Gui::drawProcessing() {
     HelpMarker("Display only. Thresholds always apply to the linear detection signal.");
 }
 
-void Gui::drawSequence() {
-    EnumCombo("Trigger Type", &p_.seq.type, 5, 8);
-    HelpMarker(
-        "Evaluated at each syllable onset (IOI, SD+IOI, IOI+SD+IOI) or offset (SD, IOI+SD).\n"
-        "With onsets A, B, C: at C's onset 'IOI' = C-B, 'SD' = duration of B, 'previous IOI' = B-A.\n"
-        "A match means C is the target syllable.");
-    const auto t = p_.seq.type;
-    const bool useIoi = t != TriggerType::SD;
-    const bool useSd = t != TriggerType::IOI;
-    const bool usePrev = t == TriggerType::IOI_SD_IOI;
-
-    if (ImGui::BeginTable("seq", 3, ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("");
-        ImGui::TableSetupColumn("Setpoint (ms)");
-        ImGui::TableSetupColumn("+/- eps (ms)");
-        ImGui::TableHeadersRow();
-        auto row = [&](const char* name, double* sp, double* eps, bool used) {
-            ImGui::PushID(name);
-            ImGui::TableNextRow();
-            ImGui::BeginDisabled(!used);
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(name);
-            ImGui::TableNextColumn();
-            InputD("##sp", sp, "%.4g", 5);
-            ImGui::TableNextColumn();
-            InputD("##eps", eps, "%.4g", 5);
-            ImGui::EndDisabled();
+void Gui::drawTarget() {
+    auto& c = p_.codes;
+    const SyllableCode* t = targetSyllable(c);
+    const std::string current = t ? t->name + "  (code " + std::to_string(t->code) + ")" : "none (no feedback)";
+    ImGui::SetNextItemWidth(14 * em());
+    if (ImGui::BeginCombo("Feedback target", current.c_str())) {
+        if (ImGui::Selectable("none (no feedback)", c.target < 0)) {
+            c.target = -1;
+            changed() = true;
+        }
+        for (int i = 0; i < int(c.list.size()); ++i) {
+            ImGui::PushID(i);
+            const std::string label = c.list[i].name + "  (code " + std::to_string(c.list[i].code) + ")";
+            if (ImGui::Selectable(label.c_str(), i == c.target)) {
+                c.target = i;
+                changed() = true;
+            }
             ImGui::PopID();
-        };
-        row("IOI (Setpoint 1)", &p_.seq.ioiSetpointMs, &p_.seq.ioiEpsMs, useIoi);
-        row("SD (Setpoint 2)", &p_.seq.sdSetpointMs, &p_.seq.sdEpsMs, useSd);
-        row("Prev IOI (Setpoint 3)", &p_.seq.prevIoiSetpointMs, &p_.seq.prevIoiEpsMs, usePrev);
-        ImGui::EndTable();
+        }
+        ImGui::EndCombo();
     }
+    HelpMarker("Feedback is triggered when an IOI end is classified as this syllable (it must be the first match "
+               "in the list below).");
+    if (t && !t->enabled) ImGui::TextColored(kAmber, "The target syllable is disabled, so no feedback will fire.");
 }
 
 void Gui::drawFeedback() {
@@ -369,6 +367,139 @@ void Gui::drawFeedback() {
     InputD("TTL pulse (ms)", &p_.fb.ttlPulseMs, "%.4g");
 }
 
+void Gui::drawCodes() {
+    auto& c = p_.codes;
+    ImGui::SeparatorText("Syllables");
+    HelpMarker(
+        "Each syllable has a trigger type and a window for IOI, SD and previous IOI, as setpoint +/- eps or "
+        "min / max. With onsets A, B, C: at C's onset IOI = C-B, SD = duration of B, previous IOI = B-A.\n\n"
+        "At every IOI end the list is checked top to bottom and the FIRST syllable that matches is reported: its "
+        "code is written to the syllable code port and counted, and if it is the target, feedback is triggered.\n\n"
+        "Click a syllable's header to edit it here and in the Tune tab's folder summary. In the Tune tab, "
+        "Ctrl+click a syllable to set the edited syllable's windows from it, Ctrl+Shift+click to add a new one.");
+    Check("Write codes to port##codes", &c.enabled);
+    ImGui::SameLine();
+    EnumCombo("Hold", &c.hold, 3, 9);
+    if (c.hold == SylCodeHold::Pulse) {
+        ImGui::SameLine();
+        InputD("ms##codepulse", &c.pulseMs, "%.3g", 3);
+    }
+    const auto& st = stats_;
+    if (st.running) {
+        ImGui::Text("Port now: %d", st.currentCode);
+        ImGui::SameLine();
+        ImGui::TextDisabled("  unmatched IOI ends: %llu", (unsigned long long)st.codeUnmatched);
+    }
+
+    int remove = -1, moveUp = -1;
+    const bool editChanged = editSyl_ != lastOpenedSyl_;
+    lastOpenedSyl_ = editSyl_;
+    for (int i = 0; i < int(c.list.size()); ++i) {
+        auto& e = c.list[i];
+        ImGui::PushID(i);
+        // Header: star for the target, highlighted when it is the syllable being edited.
+        std::string header = std::string(i == c.target ? "* " : "  ") + e.name + "  (code " +
+                             std::to_string(e.code) + ")" + (e.enabled ? "" : "  [off]");
+        if (st.running && i < int(st.codeCounts.size()))
+            header += "  n=" + std::to_string(st.codeCounts[i]);
+        header += "###hdr";
+        if (editChanged) ImGui::SetNextItemOpen(i == editSyl_);
+        const bool open = ImGui::TreeNodeEx(header.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth |
+                                                                ImGuiTreeNodeFlags_Framed |
+                                                                (i == editSyl_ ? ImGuiTreeNodeFlags_Selected : 0));
+        if (ImGui::IsItemClicked()) editSyl_ = lastOpenedSyl_ = i;
+        if (!open) {
+            ImGui::PopID();
+            continue;
+        }
+        Check("##en", &e.enabled);
+        ImGui::SameLine();
+        InputStr("##name", &e.name, 6);
+        ImGui::SameLine();
+        if (InputI("code", &e.code, 3)) e.code = std::clamp(e.code, 1, 255);
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("up", ImGuiDir_Up)) moveUp = i;
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("down", ImGuiDir_Down) && i + 1 < int(c.list.size())) moveUp = i + 1;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) remove = i;
+        // Trigger type: only the types evaluated at an onset (= an IOI end).
+        ImGui::SetNextItemWidth(8 * em());
+        if (ImGui::BeginCombo("##type", toString(e.type))) {
+            for (TriggerType t : {TriggerType::IOI, TriggerType::SD_IOI, TriggerType::IOI_SD_IOI})
+                if (ImGui::Selectable(toString(t), t == e.type)) {
+                    e.type = t;
+                    changed() = true;
+                }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        const RangeMode before = e.mode;
+        if (EnumCombo("##mode", &e.mode, 2, 11) && e.mode != before)
+            for (TimeWindow* w : {&e.ioi, &e.sd, &e.prevIoi}) w->convertTo(e.mode);
+
+        const bool minMax = e.mode == RangeMode::MinMax;
+        if (ImGui::BeginTable("win", 3, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("");
+            ImGui::TableSetupColumn(minMax ? "min (ms)" : "setpoint (ms)");
+            ImGui::TableSetupColumn(minMax ? "max (ms)" : "+/- eps (ms)");
+            ImGui::TableHeadersRow();
+            auto row = [&](const char* label, TimeWindow& w, bool used) {
+                ImGui::PushID(label);
+                ImGui::TableNextRow();
+                ImGui::BeginDisabled(!used);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(label);
+                ImGui::TableNextColumn();
+                InputD("##a", minMax ? &w.minMs : &w.setpointMs, "%.4g", 4.5f);
+                ImGui::TableNextColumn();
+                InputD("##b", minMax ? &w.maxMs : &w.epsMs, "%.4g", 4.5f);
+                ImGui::EndDisabled();
+                ImGui::PopID();
+            };
+            row("IOI", e.ioi, usesIoi(e.type));
+            row("SD (prev syllable)", e.sd, usesSd(e.type));
+            row("Prev IOI", e.prevIoi, usesPrevIoi(e.type));
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+        ImGui::PopID();
+    }
+    // Keep the target and the edited syllable pointing at the same entries.
+    auto remap = [](int& idx, auto f) { idx = f(idx); };
+    if (remove >= 0) {
+        c.list.erase(c.list.begin() + remove);
+        auto afterRemove = [&](int idx) { return idx == remove ? -1 : idx > remove ? idx - 1 : idx; };
+        remap(c.target, afterRemove);
+        remap(editSyl_, afterRemove);
+        if (editSyl_ < 0) editSyl_ = std::min(remove, int(c.list.size()) - 1);
+        changed() = true;
+    }
+    if (moveUp > 0) {
+        std::swap(c.list[moveUp], c.list[moveUp - 1]);
+        auto afterSwap = [&](int idx) { return idx == moveUp ? moveUp - 1 : idx == moveUp - 1 ? moveUp : idx; };
+        remap(c.target, afterSwap);
+        remap(editSyl_, afterSwap);
+        lastOpenedSyl_ = editSyl_;
+        changed() = true;
+    }
+    ImGui::Separator();
+    ImGui::BeginDisabled(int(c.list.size()) >= kMaxCodes);
+    if (ImGui::Button("+ Add syllable")) {
+        // Start from the syllable being edited (or the LabVIEW default target).
+        SyllableCode e = editSyl_ >= 0 && editSyl_ < int(c.list.size()) ? c.list[editSyl_] : defaultTargetSyllable();
+        int code = 1;
+        for (const auto& x : c.list) code = std::max(code, x.code + 1);
+        e.code = std::min(code, 255);
+        e.name = "syl" + std::to_string(c.list.size() + 1);
+        e.enabled = true;
+        c.list.push_back(e);
+        editSyl_ = int(c.list.size()) - 1;
+        changed() = true;
+    }
+    ImGui::EndDisabled();
+}
+
 void Gui::drawSong() {
     auto& s = p_.song;
     Check("Song detector enabled", &s.enabled);
@@ -402,7 +533,7 @@ void Gui::drawSong() {
     InputD("Column hop (ms)", &s.hopMs, "%.3g");
     s.windowLength = std::clamp(s.windowLength, 16, 65536);
     s.hopMs = std::max(0.1, s.hopMs);
-    const auto st = engine_.stats();
+    const auto& st = stats_;
     if (st.running && st.songFftSize > 0)
         ImGui::TextDisabled("Hann, FFT %d, %.1f Hz bins, column every %.1f ms", st.songFftSize, st.songBinHz, s.hopMs);
 
@@ -424,13 +555,50 @@ void Gui::drawSong() {
 }
 
 void Gui::drawRecording() {
-    InputStr("Output folder", &p_.rec.outputDir, 14);
-    Check("Events CSV", &p_.rec.saveEvents);
-    Check("Raw microphone WAV", &p_.rec.saveRaw);
-    Check("Detection signal WAV (frame rate)", &p_.rec.saveEnvelope);
+    auto& r = p_.rec;
+    const bool running = engine_.running();
+    ImGui::BeginDisabled(running);  // all of this is applied at Start
+    InputStr("Output folder", &r.outputDir, 14);
+    Check("Events CSV", &r.saveEvents);
+    Check("Continuous detection signal WAV (frame rate)", &r.saveEnvelope);
+
+    ImGui::SeparatorText("Song-triggered WAVs");
+    Check("Record a WAV for each song", &r.songFiles);
+    HelpMarker("When the song detector turns on, a new WAV starts with the last 'Pre-roll' seconds of audio "
+               "(so the start of the song is included) and keeps recording until song has been off for "
+               "'Post-roll' seconds. Song coming back within the post-roll extends the same file.\n"
+               "Files: <session>_song001.wav, ... plus <session>_songs.csv listing each file's start/end sample "
+               "(same clock as the events CSV).");
+    ImGui::BeginDisabled(!r.songFiles);
+    InputD("Pre-roll (s)", &r.preRollSec, "%.3g", 5);
+    r.preRollSec = std::clamp(r.preRollSec, 0.0, 60.0);
+    InputD("Post-roll (s)", &r.postRollSec, "%.3g", 5);
+    r.postRollSec = std::clamp(r.postRollSec, 0.0, 600.0);
+    ImGui::TextUnformatted("Channels:");
+    ImGui::SameLine();
+    Check("raw mic", &r.chMic);
+    ImGui::SameLine();
+    Check("detection signal", &r.chDetection);
+    ImGui::SameLine();
+    Check("marker track", &r.chMarkers);
+    HelpMarker("Each enabled channel is one channel of the WAV, in this order, at the microphone sample rate.\n"
+               "raw mic: volts.\n"
+               "detection signal: the linear detection value, held for each 1 ms frame.\n"
+               "marker track: the TTL line states added up: 0.1 song + 0.2 syllable + 0.3 target match + "
+               "0.4 feedback (match and feedback last 'TTL pulse' ms). Every combination gives a distinct level.");
+    if (r.songFiles && !r.chMic && !r.chDetection && !r.chMarkers)
+        ImGui::TextColored(kAmber, "No channels selected: no song files will be written.");
+    if (r.songFiles && !p_.song.enabled)
+        ImGui::TextColored(kAmber, "The song detector is off, so no song files will be written.");
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
     ImGui::TextDisabled("Applied at the next Start. A copy of the settings is saved with each session.");
-    const auto s = engine_.stats();
+    const auto& s = stats_;
     if (!s.sessionPrefix.empty()) ImGui::TextWrapped("Session: %s", s.sessionPrefix.c_str());
+    if (s.running && r.songFiles)
+        ImGui::TextColored(s.songFileOpen ? kGreen : ImVec4(0.7f, 0.7f, 0.7f, 1), "%s  |  %d song file(s) written",
+                           s.songFileOpen ? "RECORDING SONG" : "waiting for song", s.songFilesDone);
 }
 
 void Gui::drawDisplay() {
@@ -447,7 +615,7 @@ void Gui::drawDisplay() {
 }
 
 void Gui::drawStatus() {
-    const auto s = engine_.stats();
+    const auto& s = stats_;
     if (!s.running) {
         ImGui::TextDisabled("Not running. Pick a source and press Start.");
         return;
@@ -464,6 +632,10 @@ void Gui::drawStatus() {
     ImGui::TextColored(s.inSyllable ? kGreen : ImVec4(0.5f, 0.5f, 0.5f, 1), s.inSyllable ? "SYLLABLE" : "silence ");
     ImGui::SameLine();
     ImGui::TextColored(s.songActive ? kBlue : ImVec4(0.5f, 0.5f, 0.5f, 1), s.songActive ? "SONG" : "no song");
+    if (s.songFileOpen) {
+        ImGui::SameLine();
+        ImGui::TextColored(kRed, "REC");
+    }
     ImGui::SameLine();
     ImGui::Text("| last IOI %.0f ms  SD %.0f ms  | onsets %llu  matches %llu (blocked %llu)  trials %llu  fb1 %llu  "
                 "fb2 %llu  suppressed %llu  catch %llu  bouts %llu",

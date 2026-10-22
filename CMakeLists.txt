@@ -25,6 +25,8 @@ add_library(fp_core STATIC
   src/core/Filters.cpp
   src/core/Offline.cpp
   src/core/SongDetector.cpp
+  src/core/SongRecorder.cpp
+  src/core/SyllableCodes.cpp
   src/core/SynthSong.cpp)
 target_include_directories(fp_core PUBLIC src)
 

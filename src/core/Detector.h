@@ -11,6 +11,7 @@
 #include "core/FeedbackStateMachine.h"
 #include "core/Params.h"
 #include "core/SongDetector.h"
+#include "core/SyllableCodes.h"
 #include "core/Syllables.h"
 
 namespace fp {
@@ -24,7 +25,8 @@ struct FrameResult {
     double includeAmp = 0.0;
     double subtractAmp = 0.0;
     SegmenterOutput seg;
-    MatchResult match;
+    MatchResult match;      // the target syllable was recognized
+    SylCodeResult sylCode;  // syllable classification at each IOI end
     SongState song;
     bool songGateOpen = true;  // matches may start feedback trials
     bool matchBlocked = false; // a match happened but no song was detected
@@ -60,7 +62,7 @@ private:
     AppParams p_;
     BandEnvelope env_;
     SyllableSegmenter seg_;
-    SequenceMatcher match_;
+    SyllableClassifier classifier_;
     SongDetector song_;
     FeedbackStateMachine fsm_;
 

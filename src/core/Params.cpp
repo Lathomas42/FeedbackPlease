@@ -1,5 +1,7 @@
 #include "core/Params.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -55,14 +57,6 @@ void visitParams(AppParams& p, F&& f) {
     f("proc.gain", p.proc.gain);
     f("proc.display_db", p.proc.displayDb);
 
-    f("seq.trigger_type", p.seq.type);
-    f("seq.ioi_setpoint_ms", p.seq.ioiSetpointMs);
-    f("seq.ioi_eps_ms", p.seq.ioiEpsMs);
-    f("seq.sd_setpoint_ms", p.seq.sdSetpointMs);
-    f("seq.sd_eps_ms", p.seq.sdEpsMs);
-    f("seq.prev_ioi_setpoint_ms", p.seq.prevIoiSetpointMs);
-    f("seq.prev_ioi_eps_ms", p.seq.prevIoiEpsMs);
-
     f("fb.enabled", p.fb.enabled);
     f("fb.prob1", p.fb.prob1);
     f("fb.delay1_ms", p.fb.delay1Ms);
@@ -99,6 +93,32 @@ void visitParams(AppParams& p, F&& f) {
     f("song.duration_thresh", p.song.durationThresh);
     f("song.hold_sec", p.song.holdSec);
     f("hw.do_song_line", p.hw.doSongLine);
+    f("hw.syl_code_output", p.hw.sylCodeOutput);
+
+    f("codes.enabled", p.codes.enabled);
+    f("codes.hold", p.codes.hold);
+    f("codes.pulse_ms", p.codes.pulseMs);
+    f("codes.target", p.codes.target);
+    // The count comes first so the loader can size the list before reading entries.
+    int nCodes = int(p.codes.list.size());
+    f("codes.count", nCodes);
+    p.codes.list.resize(size_t(std::clamp(nCodes, 0, kMaxCodes)));
+    for (size_t i = 0; i < p.codes.list.size(); ++i) {
+        auto& c = p.codes.list[i];
+        const std::string k = "codes." + std::to_string(i);
+        f(k + ".name", c.name);
+        f(k + ".code", c.code);
+        f(k + ".enabled", c.enabled);
+        f(k + ".type", c.type);
+        f(k + ".mode", c.mode);
+        for (auto [w, n] : {std::pair<TimeWindow*, const char*>{&c.ioi, "ioi"}, {&c.sd, "sd"}, {&c.prevIoi, "prev_ioi"}}) {
+            const std::string kw = k + "." + n;
+            f(kw + "_setpoint_ms", w->setpointMs);
+            f(kw + "_eps_ms", w->epsMs);
+            f(kw + "_min_ms", w->minMs);
+            f(kw + "_max_ms", w->maxMs);
+        }
+    }
 
     f("display.window_sec", p.display.windowSec);
     f("display.raw_auto_y", p.display.rawAutoY);
@@ -107,8 +127,13 @@ void visitParams(AppParams& p, F&& f) {
 
     f("rec.output_dir", p.rec.outputDir);
     f("rec.save_events", p.rec.saveEvents);
-    f("rec.save_raw", p.rec.saveRaw);
     f("rec.save_envelope", p.rec.saveEnvelope);
+    f("rec.song_files", p.rec.songFiles);
+    f("rec.pre_roll_sec", p.rec.preRollSec);
+    f("rec.post_roll_sec", p.rec.postRollSec);
+    f("rec.ch_mic", p.rec.chMic);
+    f("rec.ch_detection", p.rec.chDetection);
+    f("rec.ch_markers", p.rec.chMarkers);
 }
 
 std::string trim(const std::string& s) {
@@ -183,18 +208,56 @@ bool loadParams(const std::string& path, AppParams& p, std::string* err) {
         if (eq == std::string::npos) continue;
         std::string key = trim(line.substr(0, eq));
         std::string val = line.substr(eq + 1);
-        // Strip trailing "# comment" for non-path values (paths may contain '#').
-        if (key.find("path") == std::string::npos && key.find("wave") == std::string::npos &&
-            key.find("dir") == std::string::npos) {
-            const auto hash = val.find('#');
-            if (hash != std::string::npos) val = val.substr(0, hash);
-        }
+        // Strip the "  # comment" the saver appends to enum values. Only that exact form
+        // (two spaces + '#'), so names and paths can contain '#' ("noise #1.wav").
+        const auto hash = val.find("  #");
+        if (hash != std::string::npos) val = val.substr(0, hash);
         kv[key] = trim(val);
     }
     std::string localErr;
     visitParams(p, Loader{kv, localErr});
+
+    // Settings saved before syllables existed had a single target ("seq.*" keys):
+    // turn it into a syllable called "target" and select it.
+    if (!kv.count("codes.count") && kv.count("seq.trigger_type")) {
+        SyllableCode c = defaultTargetSyllable();
+        auto num = [&](const char* k, double& v) {
+            if (auto it = kv.find(k); it != kv.end()) {
+                try { v = std::stod(it->second); } catch (...) {}
+            }
+        };
+        double type = double(int(c.type));
+        num("seq.trigger_type", type);
+        c.type = static_cast<TriggerType>(int(type));
+        if (!isOnsetEvaluated(c.type)) c.type = TriggerType::SD_IOI;  // SD / IOI,SD were decided at offsets
+        num("seq.ioi_setpoint_ms", c.ioi.setpointMs);
+        num("seq.ioi_eps_ms", c.ioi.epsMs);
+        num("seq.sd_setpoint_ms", c.sd.setpointMs);
+        num("seq.sd_eps_ms", c.sd.epsMs);
+        num("seq.prev_ioi_setpoint_ms", c.prevIoi.setpointMs);
+        num("seq.prev_ioi_eps_ms", c.prevIoi.epsMs);
+        for (TimeWindow* w : {&c.ioi, &c.sd, &c.prevIoi}) w->convertTo(RangeMode::MinMax);  // fill min/max
+        p.codes.list = {c};
+        p.codes.target = 0;
+    }
+    if (p.codes.target >= int(p.codes.list.size())) p.codes.target = -1;
     if (err) *err = localErr;
     return localErr.empty();
+}
+
+SyllableCode defaultTargetSyllable() {
+    SyllableCode c;
+    c.name = "target";
+    c.code = 1;
+    c.type = TriggerType::IOI_SD_IOI;
+    c.ioi = {124.0, 10.0, 114.0, 134.0};
+    c.sd = {95.0, 10.0, 85.0, 105.0};
+    c.prevIoi = {95.0, 10.0, 85.0, 105.0};
+    return c;
+}
+
+const SyllableCode* targetSyllable(const SyllableCodeParams& p) {
+    return p.target >= 0 && p.target < int(p.list.size()) ? &p.list[size_t(p.target)] : nullptr;
 }
 
 bool saveParams(const std::string& path, const AppParams& p, std::string* err) {
@@ -242,6 +305,45 @@ const char* toString(SourceKind k) {
     switch (k) {
         case SourceKind::Daq: return "NI-DAQmx";
         case SourceKind::Simulated: return "Simulated (WAV / synthetic)";
+    }
+    return "?";
+}
+
+bool TimeWindow::contains(double v, RangeMode m) const {
+    if (m == RangeMode::MinMax) return v >= minMs && v <= maxMs;
+    return std::fabs(v - setpointMs) <= epsMs;
+}
+
+void TimeWindow::convertTo(RangeMode to) {
+    if (to == RangeMode::MinMax) {
+        minMs = setpointMs - epsMs;
+        maxMs = setpointMs + epsMs;
+    } else {
+        setpointMs = 0.5 * (minMs + maxMs);
+        epsMs = 0.5 * std::fabs(maxMs - minMs);
+    }
+}
+
+bool usesIoi(TriggerType t) { return t != TriggerType::SD; }
+bool usesSd(TriggerType t) { return t != TriggerType::IOI; }
+bool usesPrevIoi(TriggerType t) { return t == TriggerType::IOI_SD_IOI; }
+bool isOnsetEvaluated(TriggerType t) {
+    return t == TriggerType::IOI || t == TriggerType::SD_IOI || t == TriggerType::IOI_SD_IOI;
+}
+
+const char* toString(RangeMode m) {
+    switch (m) {
+        case RangeMode::SetpointEps: return "Setpoint +/- eps";
+        case RangeMode::MinMax: return "Min / max";
+    }
+    return "?";
+}
+
+const char* toString(SylCodeHold h) {
+    switch (h) {
+        case SylCodeHold::UntilOffset: return "Until syllable ends";
+        case SylCodeHold::UntilNextOnset: return "Until next onset";
+        case SylCodeHold::Pulse: return "Pulse";
     }
     return "?";
 }

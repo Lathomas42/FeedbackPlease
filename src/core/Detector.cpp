@@ -5,7 +5,10 @@
 
 namespace fp {
 
-Detector::Detector(uint32_t seed) : fsm_(seed) { setParams(AppParams{}); }
+Detector::Detector(uint32_t seed) : fsm_(seed) {
+    classifier_.reset();
+    setParams(AppParams{});
+}
 
 int Detector::windowSamplesFor(const AppParams& p) {
     return std::max(16, int(std::lround(p.spectrum.windowMs * p.hw.sampleRate / 1000.0)));
@@ -31,7 +34,7 @@ void Detector::reset() {
     filled_ = 0;
     samples_ = 0;
     seg_.reset();
-    match_.reset();
+    classifier_.reset();
     song_.reset();
     fsm_.reset();
 }
@@ -70,7 +73,10 @@ FrameResult Detector::decide(uint64_t sampleEnd, double value, const SongState& 
     r.displayValue = toDisplay(value, p_.proc.displayDb);
 
     r.seg = seg_.update(value, r.tMs, p_.spectrum.sylStartThresh, p_.spectrum.sylEndThresh);
-    r.match = match_.update(r.seg, p_.seq);
+    r.sylCode = classifier_.update(r.seg, p_.codes);
+    // The target is just one of the syllables: it matches when it is the first match.
+    r.match.evaluated = r.sylCode.evaluated;
+    r.match.match = r.sylCode.evaluated && r.sylCode.index >= 0 && r.sylCode.index == p_.codes.target;
 
     r.song = song;
     r.songGateOpen = !p_.song.enabled || !p_.song.gateFeedback || song.active;

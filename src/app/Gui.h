@@ -23,9 +23,10 @@ private:
     void drawHardware();
     void drawSpectrum();
     void drawProcessing();
-    void drawSequence();
+    void drawTarget();
     void drawFeedback();
     void drawSong();
+    void drawCodes();
     void drawRecording();
     void drawDisplay();
     void drawStatus();
@@ -37,9 +38,12 @@ private:
     AppParams p_;
     std::string settingsPath_;
     Engine engine_;
+    EngineStats stats_;  // copied once per frame in draw()
     TuneView tune_;
     std::string status_;
     bool selectTuneTab_ = false;
+    int editSyl_ = 0;         // syllable being edited (shared with the Tune tab)
+    int lastOpenedSyl_ = -1;  // to open the edited syllable's panel once when it changes
     ScopeSnapshot snap_;
     std::vector<double> xs_, ys_;
 };

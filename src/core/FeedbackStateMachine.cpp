@@ -35,6 +35,9 @@ FeedbackOutput FeedbackStateMachine::update(bool detect, double value, double dt
     bool rising = detect && !lastDetect_;
     lastDetect_ = detect;
 
+    // Switching feedback off cancels a trial that is waiting to deliver.
+    if (!p.enabled && st_ != FbState::Listening && st_ != FbState::RefractoryPeriod) st_ = FbState::Listening;
+
     if (st_ == FbState::Delay1 || st_ == FbState::Delay2 || st_ == FbState::RefractoryPeriod) elapsedMs_ += dtMs;
 
     // LabVIEW advances one state per loop iteration, which adds a frame of latency

@@ -39,20 +39,48 @@ std::string fmt(const char* f, double a, double b = 0, double c = 0) {
 
 // ---------------------------------------------------------------- AsyncRecorder
 
-bool AsyncRecorder::open(const std::string& rawPath, double rawRate, const std::string& envPath, double envRate) {
+bool AsyncRecorder::open(const std::string& envPath, double envRate, const std::string& eventsPath,
+                         const SongFileConfig* songs, std::string* err) {
     close();
-    if (!rawPath.empty() && !raw_.open(rawPath, rawRate)) return false;
-    if (!envPath.empty() && !env_.open(envPath, envRate)) return false;
-    if (!raw_.isOpen() && !env_.isOpen()) return true;
+    bool ok = true;
+    if (!envPath.empty() && !env_.open(envPath, envRate)) {
+        if (err) *err = "cannot write " + envPath;
+        ok = false;
+    }
+    if (ok && !eventsPath.empty()) {
+        events_.open(std::filesystem::u8path(eventsPath));
+        if (!events_.is_open()) {
+            if (err) *err = "cannot write " + eventsPath;
+            ok = false;
+        }
+    }
+    if (ok && songs) ok = songs_.open(*songs, err);
+    if (!ok) {
+        close();  // don't leave half the files open
+        return false;
+    }
+    if (events_.is_open()) events_ << "sample,time_ms,event,value,detail\n";
+    eventsOn_ = events_.is_open();
+    songsOn_ = songs != nullptr;
+    frameN_ = 0;
+    if (!env_.isOpen() && !eventsOn_ && !songsOn_) return true;
     stop_ = false;
     th_ = std::thread(&AsyncRecorder::run, this);
     return true;
 }
 
-void AsyncRecorder::pushRaw(const float* x, size_t n) {
-    if (!raw_.isOpen()) return;
+void AsyncRecorder::pushEventLine(std::string line) {
+    if (!eventsOn_) return;
     std::lock_guard<std::mutex> lk(mx_);
-    pendRaw_.insert(pendRaw_.end(), x, x + n);
+    pendLines_.push_back(std::move(line));
+}
+
+void AsyncRecorder::pushFrame(const float* mic, int n, float detection, float marker, bool song) {
+    if (!songsOn_) return;
+    std::lock_guard<std::mutex> lk(mx_);
+    frameN_ = n;  // constant for a run
+    pendMic_.insert(pendMic_.end(), mic, mic + n);
+    pendMeta_.push_back({detection, marker, song});
 }
 
 void AsyncRecorder::pushEnv(float v) {
@@ -62,20 +90,33 @@ void AsyncRecorder::pushEnv(float v) {
 }
 
 void AsyncRecorder::run() {
-    std::vector<float> r, e;
+    std::vector<float> mic, e;
+    std::vector<FrameMeta> meta;
+    std::vector<std::string> lines;
     for (;;) {
         bool done;
+        int n;
         {
             std::unique_lock<std::mutex> lk(mx_);
             cv_.wait_for(lk, std::chrono::milliseconds(100), [&] { return stop_; });
-            r.swap(pendRaw_);
+            // Swapping hands the (cleared) buffers back, so steady state has no reallocations.
+            mic.swap(pendMic_);
+            meta.swap(pendMeta_);
             e.swap(pendEnv_);
+            lines.swap(pendLines_);
+            n = frameN_;
             done = stop_;
         }
-        raw_.write(r.data(), r.size());
+        // Song files: pre-roll ring + start/extend/end decisions, frame by frame.
+        for (size_t f = 0; f < meta.size() && n > 0; ++f)
+            songs_.push(&mic[f * size_t(n)], n, meta[f].detection, meta[f].marker, meta[f].song);
         env_.write(e.data(), e.size());
-        r.clear();
+        for (const auto& l : lines) events_ << l << '\n';
+        if (!lines.empty()) events_.flush();  // a crash loses at most ~100 ms of events
+        mic.clear();
+        meta.clear();
         e.clear();
+        lines.clear();
         if (done) break;
     }
 }
@@ -89,10 +130,14 @@ void AsyncRecorder::close() {
         cv_.notify_all();
         th_.join();
     }
-    raw_.close();
+    songs_.close();  // finishes a song file in progress (its WAV header and index row)
     env_.close();
-    pendRaw_.clear();
+    if (events_.is_open()) events_.close();
+    eventsOn_ = songsOn_ = false;
+    pendMic_.clear();
+    pendMeta_.clear();
     pendEnv_.clear();
+    pendLines_.clear();
 }
 
 // ---------------------------------------------------------------- Engine
@@ -125,6 +170,7 @@ bool Engine::start(const AppParams& params, std::string& err) {
     if (!openSession(p, err)) {
         io_->stop();
         io_.reset();
+        recorder_.close();
         return false;
     }
 
@@ -162,7 +208,6 @@ void Engine::stop() {
     }
     running_ = false;
     recorder_.close();
-    if (eventsCsv_.is_open()) eventsCsv_.close();
     std::lock_guard<std::mutex> lk(mx_);
     stats_.running = false;
 }
@@ -170,7 +215,8 @@ void Engine::stop() {
 bool Engine::openSession(const AppParams& p, std::string& err) {
     std::string prefix;
     const auto& rec = p.rec;
-    if (rec.saveEvents || rec.saveRaw || rec.saveEnvelope) {
+    const bool songFiles = rec.songFiles && (rec.chMic || rec.chDetection || rec.chMarkers);
+    if (rec.saveEvents || songFiles || rec.saveEnvelope) {
         std::error_code ec;
         std::filesystem::create_directories(rec.outputDir, ec);
         if (ec) {
@@ -179,18 +225,19 @@ bool Engine::openSession(const AppParams& p, std::string& err) {
         }
         prefix = (std::filesystem::path(rec.outputDir) / ("session_" + timestamp())).string();
         saveParams(prefix + "_settings.ini", p);
-        if (rec.saveEvents) {
-            eventsCsv_.open(prefix + "_events.csv");
-            if (!eventsCsv_) {
-                err = "cannot write " + prefix + "_events.csv";
-                return false;
-            }
-            eventsCsv_ << "sample,time_ms,event,value,detail\n";
-        }
         const double fs = p.hw.sampleRate;
-        if (!recorder_.open(rec.saveRaw ? prefix + "_raw.wav" : "", fs,
-                            rec.saveEnvelope ? prefix + "_envelope.wav" : "", fs / p.hw.samplesPerFrame)) {
-            err = "cannot open recording files at " + prefix;
+        SongFileConfig songs;
+        songs.prefix = prefix;
+        songs.sampleRate = fs;
+        songs.preRollSec = rec.preRollSec;
+        songs.postRollSec = rec.postRollSec;
+        songs.mic = rec.chMic;
+        songs.detection = rec.chDetection;
+        songs.markers = rec.chMarkers;
+        std::string recErr;
+        if (!recorder_.open(rec.saveEnvelope ? prefix + "_envelope.wav" : "", fs / p.hw.samplesPerFrame,
+                            rec.saveEvents ? prefix + "_events.csv" : "", songFiles ? &songs : nullptr, &recErr)) {
+            err = "cannot open recording files: " + recErr;
             return false;
         }
     }
@@ -206,9 +253,13 @@ void Engine::updateParams(const AppParams& p) {
 }
 
 void Engine::logEvent(double tMs, const char* type, const std::string& detail, double value) {
-    if (eventsCsv_.is_open()) {
+    if (recorder_.eventsOpen()) {
         const uint64_t sample = uint64_t(std::llround(tMs * startParams_.hw.sampleRate / 1000.0));
-        eventsCsv_ << sample << ',' << tMs << ',' << type << ',' << value << ',' << detail << '\n';
+        char head[96];
+        std::snprintf(head, sizeof head, "%llu,%.3f,", (unsigned long long)sample, tMs);
+        char val[32];
+        std::snprintf(val, sizeof val, ",%.6g,", value);
+        recorder_.pushEventLine(head + std::string(type) + val + detail);
     }
     std::lock_guard<std::mutex> lk(mx_);
     events_.push_back({tMs, type, detail});
@@ -237,6 +288,11 @@ void Engine::run() {
     uint64_t frames = 0;
     uint64_t onsets = 0, matches = 0, blocked = 0, trials = 0, fires1 = 0, fires2 = 0, suppressed = 0, catches = 0;
     uint64_t songBouts = 0;
+    std::vector<uint64_t> codeCounts;
+    std::vector<int> countedCodes;  // codes of the list the counts belong to
+    uint64_t codeUnmatched = 0;
+    int codeOut = 0;            // value currently on the syllable code port
+    double codePulseLeftMs = 0.0;
     bool songWasActive = false;
     double lastIoi = 0.0, lastSd = 0.0;
     std::string err;
@@ -259,6 +315,8 @@ void Engine::run() {
         }
         if (resetCounters_.exchange(false)) {
             onsets = matches = blocked = trials = fires1 = fires2 = suppressed = catches = songBouts = 0;
+            std::fill(codeCounts.begin(), codeCounts.end(), 0);
+            codeUnmatched = 0;
             procMax = maxBacklog = 0.0;
         }
 
@@ -283,6 +341,24 @@ void Engine::run() {
         dout.syllable = r.seg.inSyllable;
         dout.song = r.song.active;
         io_->writeDigital(dout);
+
+        // Syllable code port: set at each IOI end to the first matching entry's code
+        // (0 if none), then cleared according to the hold mode.
+        int codeNext = codeOut;
+        if (r.sylCode.evaluated) {
+            codeNext = r.sylCode.code;
+            codePulseLeftMs = p.codes.pulseMs;
+        } else if (p.codes.hold == SylCodeHold::UntilOffset && r.seg.offset) {
+            codeNext = 0;
+        } else if (p.codes.hold == SylCodeHold::Pulse) {
+            codePulseLeftMs -= frameMs;
+            if (codePulseLeftMs <= 0.0) codeNext = 0;
+        }
+        if (!p.codes.enabled) codeNext = 0;
+        if (codeNext != codeOut) {
+            codeOut = codeNext;
+            io_->writeSyllableCode(uint8_t(codeOut));
+        }
         fbPulseLeftMs -= frameMs;
         matchPulseLeftMs -= frameMs;
         io_->service();
@@ -311,10 +387,30 @@ void Engine::run() {
             if (r.song.active) ++songBouts;
             logEvent(t, r.song.active ? "song on" : "song off", fmt("fraction %.2f", r.song.fraction), r.song.ratio);
         }
+        // Counts are per list position: start over if syllables were added, removed or reordered.
+        bool listChanged = countedCodes.size() != p.codes.list.size();
+        for (size_t i = 0; !listChanged && i < countedCodes.size(); ++i)
+            listChanged = countedCodes[i] != p.codes.list[i].code;
+        if (listChanged) {
+            countedCodes.clear();
+            for (const auto& c : p.codes.list) countedCodes.push_back(c.code);
+            codeCounts.assign(p.codes.list.size(), 0);
+        }
+        if (r.sylCode.evaluated) {
+            if (r.sylCode.index >= 0) {
+                ++codeCounts[size_t(r.sylCode.index)];
+                logEvent(t, "syllable", p.codes.list[size_t(r.sylCode.index)].name + fmt("  (code %.0f)", r.sylCode.code),
+                         r.value);
+            } else {
+                ++codeUnmatched;
+            }
+        }
         if (r.match.match) {
             ++matches;
             if (r.matchBlocked) ++blocked;
-            logEvent(t, "match", std::string(toString(p.seq.type)) + (r.matchBlocked ? "  (blocked: no song)" : ""),
+            const SyllableCode* tgt = targetSyllable(p.codes);
+            logEvent(t, "match", (tgt ? "target " + tgt->name : std::string("target")) +
+                                     (r.matchBlocked ? "  (blocked: no song)" : ""),
                      r.value);
         }
         if (r.fb.trialStarted) ++trials;
@@ -333,7 +429,9 @@ void Engine::run() {
         const std::string outErr = io_->takeOutputError();
         if (!outErr.empty()) logEvent(t, "error", outErr, 0.0);
 
-        recorder_.pushRaw(frame.data(), frame.size());
+        // Song files get the same states as the TTL lines, summed into one marker track.
+        const float marker = 0.1f * dout.song + 0.2f * dout.syllable + 0.3f * dout.match + 0.4f * dout.feedback;
+        recorder_.pushFrame(frame.data(), n, float(r.value), marker, r.song.active);
         recorder_.pushEnv(float(r.value));
 
         // ---- GUI-visible state
@@ -372,6 +470,11 @@ void Engine::run() {
             s.songBinHz = det.songDetector().binHz();
             s.songBouts = songBouts;
             s.blocked = blocked;
+            s.songFilesDone = recorder_.songFilesDone();
+            s.songFileOpen = recorder_.songRecording();
+            s.currentCode = codeOut;
+            s.codeCounts = codeCounts;
+            s.codeUnmatched = codeUnmatched;
             s.fbState = r.fbState;
             s.onsets = onsets;
             s.matches = matches;
@@ -384,7 +487,7 @@ void Engine::run() {
     }
 
     io_->writeDigital(DigitalOutputs{});
-    eventsCsv_.flush();
+    io_->writeSyllableCode(0);
     running_ = false;
     std::lock_guard<std::mutex> lk(mx_);
     stats_.running = false;

@@ -94,37 +94,43 @@ bool readWav(const std::string& path, WavData& out, std::string* err) {
 
 WavWriter::~WavWriter() { close(); }
 
-bool WavWriter::open(const std::string& path, double sampleRate) {
+bool WavWriter::open(const std::string& path, double sampleRate, int channels) {
     close();
+#ifdef _WIN32
+    f_ = _wfopen(std::filesystem::u8path(path).c_str(), L"wb");  // UTF-8 / UNC paths
+#else
     f_ = std::fopen(path.c_str(), "wb");
+#endif
     if (!f_) return false;
     frames_ = 0;
+    channels_ = channels < 1 ? 1 : channels;
     const uint32_t rate = uint32_t(sampleRate + 0.5);
+    const uint16_t ch = uint16_t(channels_);
     std::fwrite("RIFF", 1, 4, f_);
     wr32(f_, 0);  // patched on close
     std::fwrite("WAVEfmt ", 1, 8, f_);
     wr32(f_, 16);
     wr16(f_, 3);  // IEEE float
-    wr16(f_, 1);
+    wr16(f_, ch);
     wr32(f_, rate);
-    wr32(f_, rate * 4);
-    wr16(f_, 4);
+    wr32(f_, rate * 4u * ch);
+    wr16(f_, uint16_t(4 * ch));
     wr16(f_, 32);
     std::fwrite("data", 1, 4, f_);
     wr32(f_, 0);  // patched on close
     return true;
 }
 
-void WavWriter::write(const float* x, size_t n) {
-    if (!f_ || n == 0) return;
-    std::fwrite(x, sizeof(float), n, f_);
-    frames_ += n;
+void WavWriter::write(const float* x, size_t frames) {
+    if (!f_ || frames == 0) return;
+    std::fwrite(x, sizeof(float), frames * size_t(channels_), f_);
+    frames_ += frames;
 }
 
 void WavWriter::close() {
     if (!f_) return;
     // RIFF sizes are 32-bit; files over 4 GB (~7 h at 40 kHz) get clamped sizes.
-    const uint64_t dataBytes = frames_ * 4;
+    const uint64_t dataBytes = frames_ * 4u * uint64_t(channels_);
     const uint32_t d32 = dataBytes > 0xFFFFFFF0ull ? 0xFFFFFFF0u : uint32_t(dataBytes);
     std::fseek(f_, 4, SEEK_SET);
     wr32(f_, d32 + 36);

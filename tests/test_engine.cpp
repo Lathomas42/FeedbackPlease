@@ -42,6 +42,14 @@ int main() {
     AppParams p;
     p.source.kind = SourceKind::Simulated;
     p.rec.saveEvents = false;
+    // One syllable code: the motif's 124 ms IOI (the 4th syllable).
+    SyllableCode sylD;
+    sylD.name = "D";
+    sylD.code = 4;
+    sylD.type = TriggerType::IOI;
+    sylD.ioi = {124.0, 8.0, 116.0, 132.0};
+    p.codes.list = {sylD};  // the only syllable, and the feedback target
+    p.codes.target = 0;
     Engine e;
     std::string err;
     if (!e.start(p, err)) {
@@ -63,6 +71,10 @@ int main() {
     if (s.matches < 2 || s.fires1 != s.matches) { std::printf("FAIL matches/feedback\n"); ++fails; }
     if (snap.raw.size() != 80000 || snap.env.size() != 2000) { std::printf("FAIL scope sizes\n"); ++fails; }
     if (!e.error().empty()) { std::printf("FAIL engine error: %s\n", e.error().c_str()); ++fails; }
+    const uint64_t dCount = s.codeCounts.empty() ? 0 : s.codeCounts[0];
+    std::printf("syllable code 'D': %llu (unmatched IOI ends %llu)\n", (unsigned long long)dCount,
+                (unsigned long long)s.codeUnmatched);
+    if (dCount < 2 || dCount != s.matches) { std::printf("FAIL syllable code count\n"); ++fails; }
     std::printf(fails ? "Engine test FAILED\n" : "Engine test passed\n");
     return fails ? 1 : 0;
 }
